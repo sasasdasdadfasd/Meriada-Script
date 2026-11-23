@@ -1,1344 +1,1347 @@
 --[[
-    Revengers X | Combat Suite  (client executor, Luau)
-    ---------------------------------------------------------------------------
+    ============================================================================
+    REVENGERS X — MODULAR COMBAT SUITE (Auto Block 5-Hit, Post-Hit Recovery, Parry)
+    Language: Luau (Roblox Client Executor Compatible)
     Sections:
-      0. Boot            - services, executor capabilities (all pcall-safe), single-instance guard
-      1. Config / State  - defaults, runtime state, JSON config I/O
-      2. Utils           - Maid, math/colour helpers, tween helper
-      3. Input           - key / remote output, anti-stuck, release-all
-      4. Combat Core     - threat tracking, Auto Block, Recovery, Dodge, Learn mode
-      5. UI Library      - window, tabs, components, toasts
-      6. Tabs            - Combat / Settings / Theme
-      7. Lifecycle       - event wiring, main loops, Unload
-
-    Hotkeys:  RightShift = menu (changeable)  |  H = Auto Block toggle  |  J = Auto Dodge toggle
-    Notes:    Remote names and stun names of the game are unknown -> Remote mode and
-              stun detection are best-effort heuristics (see STUN_PATTERNS / REMOTE_PATTERNS).
+      [SEC 1] Config & Runtime State
+      [SEC 2] Safe Executor Wrappers, Services & Input Manager (Anti-Stuck)
+      [SEC 3] Combat Core (5-Hit Combo Hold, Post-Hit Recovery, Auto Parry, Learn Mode)
+      [SEC 4] Custom Dark UI Library (Tween Open/Close, Drag, Toasts, Theme Engine)
+      [SEC 5] UI Tabs (Combat, Settings, Theme) & Lifecycle / Safe Unload
+    ============================================================================
 ]]
 
---==============================================================================
--- 0. BOOT
---==============================================================================
-if not game:IsLoaded() then game.Loaded:Wait() end
-
-local function getService(name)
-    local ok, svc = pcall(game.GetService, game, name)
-    if not ok or not svc then return nil end
-    if typeof(cloneref) == "function" then
-        local ok2, clone = pcall(cloneref, svc)
-        if ok2 and clone then return clone end
-    end
-    return svc
+-- Prevent duplicate instances; cleanly unload previous instance if re-executed
+if getgenv and getgenv().__RevengersX_Unload then
+    pcall(getgenv().__RevengersX_Unload)
 end
 
-local Players          = getService("Players")
-local RunService       = getService("RunService")
-local UserInputService = getService("UserInputService")
-local TweenService     = getService("TweenService")
-local HttpService      = getService("HttpService")
-local Stats            = getService("Stats")
-local CoreGui          = getService("CoreGui")
-local VIM              = getService("VirtualInputManager")
+-- ============================================================================
+-- [SEC 1] CONFIG & RUNTIME STATE
+-- ============================================================================
+local Config = {
+    Combat = {
+        AutoBlock = true,
+        PostHitRecovery = true,
+        AutoDodge = true,
+        DodgeFallbackToBlock = true,
 
-assert(Players and RunService and UserInputService and TweenService and HttpService, "[RevengersX] core services missing")
-local LP = Players.LocalPlayer
+        -- Timing parameters tuned for 4-5 hit fighting combos
+        BlockLeadTime = 0.14,         -- Seconds before impact to press Block
+        ComboHoldExtension = 0.38,    -- Extra hold window between M1 combo hits (prevents dropping block mid-string)
+        PostHitWindow = 0.45,         -- Window after stun/hit where recovery immediately re-raises block
+        MinBlockDuration = 0.22,      -- Minimum hold time once block starts
 
--- Executor capability table: every entry is either a function or nil
-local function fn(f) return typeof(f) == "function" and f or nil end
-local function safeGet(getter)
-    local ok, v = pcall(getter)
-    return ok and v or nil
-end
+        DodgeLeadTime = 0.11,         -- Seconds before impact to tap Dodge/Parry
+        DodgeCooldown = 1.60,         -- Cooldown of Q dodge
+        DodgeTapDuration = 0.05,      -- Key hold duration for dodge tap
 
-local Exec = {
-    getgenv   = fn(getgenv),
-    gethui    = fn(gethui),
-    writefile = fn(writefile),
-    readfile  = fn(readfile),
-    isfile    = fn(isfile),
-    isfolder  = fn(isfolder),
-    makefolder= fn(makefolder),
-    keypress  = fn(keypress),
-    keyrelease= fn(keyrelease),
-    protect   = fn(safeGet(function() return syn.protect_gui end))
-             or fn(safeGet(function() return protectgui end))
-             or fn(safeGet(function() return protect_gui end)),
+        -- Threat filtering
+        MaxDistance = 16.5,           -- Studs
+        FacingCheck = true,
+        FacingDotThreshold = 0.35,    -- LookVector dot product threshold (-1 to 1)
+        PingMultiplier = 1.00,        -- Scales network ping compensation
+        IgnoreTeamAndDead = true,
+        FilterMode = "AllCombat",     -- "AllCombat" | "WhitelistOnly"
+        LearnMode = false,
+    },
+    Settings = {
+        InputMode = "Auto",           -- "Key" | "Remote" | "Auto"
+        KeyMethod = "VIM",            -- "VIM" | "keypress" | "Both"
+        BlockKey = "F",
+        DodgeKey = "Q",
+        MenuKey = "RightShift",
+        MaxKeyHoldWatchdog = 2.60,    -- Anti-stuck safety release timeout
+        ConfigFolder = "RevengersX_Config",
+        ConfigFile = "RevengersX_Config/settings.json",
+    },
+    Theme = {
+        AccentHEX = "#7C3AED",
+        AccentR = 124,
+        AccentG = 58,
+        AccentB = 237,
+        AnimatedHeader = true,
+        WindowTransparency = 0.06,
+    },
+    -- Known attack animations & dynamically learned hit timings: [animId] = hitFraction (0.0 - 1.0)
+    AttackWhitelist = {
+        -- Can be populated or learned via Learn Mode
+    },
+    LearnedTimings = {}
 }
-
--- Global environment + single instance guard (re-execute = clean reload)
-local env = (Exec.getgenv and safeGet(Exec.getgenv)) or _G
-if type(env) ~= "table" then env = _G end
-if env.RevengersX and type(env.RevengersX.Unload) == "function" then
-    pcall(env.RevengersX.Unload)
-    task.wait(0.15)
-end
-
---==============================================================================
--- 1. CONFIG / STATE
---==============================================================================
-local Defaults = {
-    Block = {
-        Enabled = false, Bind = "H",
-        Lead = 0.10,            -- extra safety margin before the hit (s)
-        Hold = 0.35,            -- how long to keep block after the hit lands (s)
-        ComboBridge = 0.35,     -- extra hold bridging the gap to the next hit of a combo (s)
-        ComboGap = 0.90,        -- max time between attack starts to count as one combo (s)
-        ComboMax = 5,           -- hits in a full string
-        Recovery = true,        -- post-hit / hitstun recovery mode
-        RecoveryWindow = 0.70,  -- how long after being hit we try to re-block (s)
-    },
-    Dodge = {
-        Enabled = false, Bind = "J",
-        Lead = 0.06, Cooldown = 1.20, Tap = 0.08,
-        Fallback = true,        -- fall back to Auto Block if dodge is on cooldown / unavailable
-    },
-    Detect = {
-        MaxDistance = 20,
-        FacingCheck = true, FacingThreshold = 0.30,
-        PingComp = true, PingScale = 1.0,
-        Filter = "All",         -- "All" (every non-looped combat anim) | "Learned" (only learned attacks)
-        HitFraction = 0.35,     -- default hit moment as fraction of animation length
-        IgnoreTeam = true, IgnoreFriends = true,
-    },
-    Input = {
-        Mode = "Auto",          -- Auto | Key | Remote
-        Method = "VIM",         -- VIM | keypress | Both
-        BlockKey = "F", DodgeKey = "Q", MenuKey = "RightShift",
-        MaxHold = 5.0,          -- anti-stuck watchdog (s)
-    },
-    Theme = { Accent = "E5334F", AnimateTitle = true, Transparency = 0.04 },
-    Learned = {},               -- [animId] = { hit = animTimePosition, n = samples }
-}
-
-local function deepCopy(t)
-    local c = {}
-    for k, v in pairs(t) do c[k] = type(v) == "table" and deepCopy(v) or v end
-    return c
-end
-
-local Cfg = deepCopy(Defaults)
 
 local State = {
-    Unloaded = false, Learn = false, MenuOpen = false,
-    Stunned = false, PrevStunned = false, Ping = 0.05,
+    Unloaded = false,
+    MenuOpen = true,
+    IsBlocking = false,
+    BlockStartTimestamp = 0,
+    BlockReleaseTimestamp = 0,
+    LastDodgeTimestamp = 0,
+    IsDodging = false,
+
+    -- Combo & Post-Hit tracking
+    ActiveComboCount = 0,
+    LastEnemySwingTimestamp = 0,
+    LastDamageTakenTimestamp = 0,
+    LastHealth = nil,
+    WasInHitstun = false,
+
+    -- Active connections & tracked animations
+    Connections = {},
+    TrackedTracks = {}, -- [AnimationTrack] = metadata
+    BindingTarget = nil,
 }
 
--- Merge decoded JSON into Cfg *in place* (UI components keep their table references)
-local function deepMerge(dst, src)
-    for k, v in pairs(src) do
-        local d = dst[k]
-        if k == "Learned" and type(v) == "table" then
-            local clean = {}
-            for id, e in pairs(v) do
-                if type(e) == "table" and type(e.hit) == "number" then
-                    clean[tostring(id)] = { hit = e.hit, n = tonumber(e.n) or 1 }
-                end
-            end
-            dst[k] = clean
-        elseif type(d) == "table" and type(v) == "table" then
-            deepMerge(d, v)
-        elseif d ~= nil and type(d) == type(v) then
-            dst[k] = v
+-- ============================================================================
+-- [SEC 2] SAFE EXECUTOR WRAPPERS, SERVICES & INPUT MANAGER
+-- ============================================================================
+local function SafeGetService(serviceName)
+    local ok, svc = pcall(function()
+        local s = game:GetService(serviceName)
+        if cloneref then
+            return cloneref(s)
         end
-    end
-end
-
-local UI = { Elements = {}, AccentHooks = {}, Gradients = {}, Accent = Color3.fromRGB(229, 51, 79) }
-local Combat, Block -- forward declarations
-
-local function log(fmt, ...)
-    local ok, msg = pcall(string.format, "[RevengersX] " .. fmt, ...)
-    print(ok and msg or fmt)
-end
-
---==============================================================================
--- 2. UTILS
---==============================================================================
-local Maid = {}
-Maid.__index = Maid
-function Maid.new() return setmetatable({ _items = {}, _dead = false }, Maid) end
-
-local function disposeItem(x)
-    pcall(function()
-        local ty = typeof(x)
-        if ty == "RBXScriptConnection" then x:Disconnect()
-        elseif ty == "Instance" then x:Destroy()
-        elseif ty == "function" then x()
-        elseif ty == "thread" then task.cancel(x)
-        elseif type(x) == "table" and type(x.Destroy) == "function" then x:Destroy() end
+        return s
     end)
-end
-function Maid:Add(x)
-    if self._dead then disposeItem(x) else table.insert(self._items, x) end
-    return x
-end
-function Maid:Clean()
-    local items = self._items
-    self._items = {}
-    for i = #items, 1, -1 do disposeItem(items[i]) end
-end
-function Maid:Destroy() self._dead = true; self:Clean() end
-
-local MainMaid = Maid.new()
-
-local function toHex(c)
-    return string.format("%02X%02X%02X", math.round(c.R * 255), math.round(c.G * 255), math.round(c.B * 255))
-end
-local function fromHex(s)
-    s = (tostring(s or ""):gsub("[#%s]", ""))
-    if #s == 3 then s = s:gsub(".", "%0%0") end
-    if not s:match("^%x%x%x%x%x%x$") then return nil end
-    return Color3.fromRGB(tonumber(s:sub(1, 2), 16), tonumber(s:sub(3, 4), 16), tonumber(s:sub(5, 6), 16))
-end
-local function keyCode(name)
-    if not name or name == "None" then return nil end
-    local ok, kc = pcall(function() return Enum.KeyCode[name] end)
-    return ok and kc or nil
-end
-local function tween(inst, info, props)
-    local ok, tw = pcall(TweenService.Create, TweenService, inst, info, props)
-    if ok and tw then tw:Play() return tw end
+    return ok and svc or nil
 end
 
---==============================================================================
--- 3. INPUT  (key emulation / remote, anti-stuck)
---==============================================================================
-local Input = { held = {} }
+local Players = SafeGetService("Players")
+local RunService = SafeGetService("RunService")
+local UserInputService = SafeGetService("UserInputService")
+local TweenService = SafeGetService("TweenService")
+local HttpService = SafeGetService("HttpService")
+local Stats = SafeGetService("Stats")
+local CoreGui = SafeGetService("CoreGui")
+local VirtualInputManager = SafeGetService("VirtualInputManager")
 
-local VK_SPECIAL = {
-    LeftShift = 0xA0, RightShift = 0xA1, LeftControl = 0xA2, RightControl = 0xA3,
-    LeftAlt = 0xA4, RightAlt = 0xA5, CapsLock = 0x14, Left = 0x25, Up = 0x26, Right = 0x27, Down = 0x28,
-}
--- Roblox KeyCode -> Windows virtual-key code (for keypress/keyrelease)
-local function toVK(kc)
-    if VK_SPECIAL[kc.Name] then return VK_SPECIAL[kc.Name] end
-    local v = kc.Value
-    if v >= 97 and v <= 122 then return v - 32 end      -- a-z -> A-Z
-    if v >= 282 and v <= 293 then return 0x70 + (v - 282) end -- F1..F12
-    if v < 97 then return v end                         -- digits, space, tab, return, esc...
+local LocalPlayer = Players and Players.LocalPlayer
+
+local function TrackConnection(conn)
+    if conn then
+        table.insert(State.Connections, conn)
+    end
+    return conn
+end
+
+-- Safe GUI Parent resolution (gethui -> CoreGui -> PlayerGui)
+local function GetSafeGuiParent()
+    if type(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and hui then return hui end
+    end
+    if CoreGui then
+        local ok, _ = pcall(function() return CoreGui.Name end)
+        if ok then return CoreGui end
+    end
+    if LocalPlayer then
+        return LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    end
     return nil
 end
 
-local REMOTE_PATTERNS = {
-    Block = { "block", "guard" },
-    Dodge = { "dodge", "dash", "roll", "evade" },
+-- Virtual KeyCodes lookup for optional keypress/keyrelease executor APIs
+local VK_MAP = {
+    F = 0x46, Q = 0x51, E = 0x45, R = 0x52, G = 0x47,
+    V = 0x56, C = 0x43, X = 0x58, Z = 0x5A, LeftShift = 0x10, RightShift = 0xA1
 }
-local remoteCache = {}
-local function findRemote(action)
-    local c = remoteCache[action]
-    if c and c.inst and c.inst.Parent then return c.inst end
-    if c and os.clock() - c.t < 5 then return nil end
-    local found
+
+local function GetEnumKeyCode(keyName)
+    local ok, code = pcall(function()
+        return Enum.KeyCode[keyName]
+    end)
+    return (ok and code) or Enum.KeyCode.F
+end
+
+-- Remote fallback discovery for Revengers X style combat remotes
+local CachedCombatRemote = nil
+local function TryFireCombatRemote(actionName, stateBool)
+    if Config.Settings.InputMode == "Key" then return false end
     pcall(function()
-        local rs = getService("ReplicatedStorage")
-        for _, d in ipairs(rs:GetDescendants()) do
-            if d:IsA("RemoteEvent") then
-                local n = d.Name:lower()
-                for _, p in ipairs(REMOTE_PATTERNS[action]) do
-                    if n:find(p, 1, true) then found = d break end
+        if not CachedCombatRemote then
+            local rep = SafeGetService("ReplicatedStorage")
+            if rep then
+                for _, desc in ipairs(rep:GetDescendants()) do
+                    if desc:IsA("RemoteEvent") then
+                        local n = string.lower(desc.Name)
+                        if string.find(n, "block") or string.find(n, "combat") or string.find(n, "guard") or string.find(n, "dodge") then
+                            CachedCombatRemote = desc
+                            break
+                        end
+                    end
                 end
             end
-            if found then break end
+        end
+        if CachedCombatRemote then
+            CachedCombatRemote:FireServer(actionName, stateBool)
         end
     end)
-    remoteCache[action] = { inst = found, t = os.clock() }
-    return found
+    return CachedCombatRemote ~= nil
 end
 
-function Input.methods()
-    local list = {}
-    if VIM then table.insert(list, "VIM") end
-    if Exec.keypress and Exec.keyrelease then table.insert(list, "keypress") end
-    if #list == 2 then table.insert(list, "Both") end
-    if #list == 0 then list = { "None" } end
-    return list
-end
-function Input.normalize()
-    local list = Input.methods()
-    if not table.find(list, Cfg.Input.Method) then Cfg.Input.Method = list[1] end
-end
-function Input.keyAvailable() return Input.methods()[1] ~= "None" end
-function Input.resolveMode()
-    local m = Cfg.Input.Mode
-    if m == "Auto" then return Input.keyAvailable() and "Key" or "Remote" end
-    return m
-end
+-- Low-level Key Press / Release with VIM + keypress support
+local HeldKeys = {}
 
-local function keySend(kc, down)
-    local m, ok = Cfg.Input.Method, false
-    if (m == "VIM" or m == "Both") and VIM then
-        ok = pcall(function() VIM:SendKeyEvent(down, kc, false, game) end) or ok
-    end
-    if (m == "keypress" or m == "Both") and Exec.keypress and Exec.keyrelease then
-        local vk = toVK(kc)
-        if vk then ok = pcall(down and Exec.keypress or Exec.keyrelease, vk) or ok end
-    end
-    if not ok then -- chosen backend unavailable/failed -> try any other
-        if VIM then ok = pcall(function() VIM:SendKeyEvent(down, kc, false, game) end) end
-        if not ok and Exec.keypress and Exec.keyrelease then
-            local vk = toVK(kc)
-            if vk then ok = pcall(down and Exec.keypress or Exec.keyrelease, vk) end
+local function SendKeyDown(keyName)
+    if State.Unloaded then return end
+    HeldKeys[keyName] = os.clock()
+    local method = Config.Settings.KeyMethod
+    local enumKey = GetEnumKeyCode(keyName)
+
+    if Config.Settings.InputMode ~= "Remote" then
+        if (method == "VIM" or method == "Both") and VirtualInputManager then
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, enumKey, false, game)
+            end)
+        end
+        if (method == "keypress" or method == "Both") and type(keypress) == "function" then
+            local vk = VK_MAP[keyName]
+            if vk then pcall(keypress, vk) end
         end
     end
-    return ok
 end
 
-local function dispatch(action, keyName, mode, down)
-    local ok = false
-    if mode == "Key" then
-        local kc = keyCode(keyName)
-        if kc then ok = keySend(kc, down) end
-    end
-    if not ok and (mode == "Remote" or Cfg.Input.Mode == "Auto") then
-        local r = findRemote(action)
-        if r then ok = pcall(function() r:FireServer(down) end) end
-    end
-    return ok
-end
+local function SendKeyUp(keyName)
+    HeldKeys[keyName] = nil
+    local method = Config.Settings.KeyMethod
+    local enumKey = GetEnumKeyCode(keyName)
 
-function Input.press(action)
-    if State.Unloaded or Input.held[action] then return end
-    if UserInputService:GetFocusedTextBox() then return end -- never type into chat
-    local keyName = action == "Block" and Cfg.Input.BlockKey or Cfg.Input.DodgeKey
-    local mode = Input.resolveMode()
-    if dispatch(action, keyName, mode, true) then
-        Input.held[action] = { key = keyName, mode = mode, t = os.clock() }
+    if (method == "VIM" or method == "Both") and VirtualInputManager then
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, enumKey, false, game)
+        end)
     end
-end
-function Input.release(action)
-    local h = Input.held[action]
-    if not h then return end
-    Input.held[action] = nil
-    dispatch(action, h.key, h.mode, false)
-end
-function Input.releaseAll()
-    local actions = {}
-    for a in pairs(Input.held) do table.insert(actions, a) end
-    for _, a in ipairs(actions) do Input.release(a) end
-end
-function Input.tap(action, dur)
-    Input.press(action)
-    if not Input.held[action] then return end
-    task.delay(math.max(dur, 0.02), function() Input.release(action) end)
-end
-function Input.watchdog(now) -- anti-stuck: force release after MaxHold
-    for a, h in pairs(Input.held) do
-        if now - h.t > Cfg.Input.MaxHold then Input.release(a) end
+    if (method == "keypress" or method == "Both") and type(keyrelease) == "function" then
+        local vk = VK_MAP[keyName]
+        if vk then pcall(keyrelease, vk) end
     end
 end
 
---==============================================================================
--- 4. COMBAT CORE
---==============================================================================
-Combat = {
-    Active = {},        -- [track] = threat
-    LearnTracks = {},   -- [track] = info (Learn mode)
-    Chains = {},        -- [player] = { count, lastStart }
-    Hooks = {},         -- [player] = { persist, char }
-    Friends = {},
-    dodgeLast = -1e9, recoveryUntil = 0, lastPing = 0, lastStun = 0,
-}
-Block = { holdUntil = 0 }
+local function ForceReleaseAllKeys()
+    for keyName, _ in pairs(HeldKeys) do
+        SendKeyUp(keyName)
+    end
+    if State.IsBlocking then
+        State.IsBlocking = false
+        SendKeyUp(Config.Settings.BlockKey)
+        TryFireCombatRemote("Block", false)
+    end
+end
 
-local STUN_PATTERNS = { "stun", "ragdoll", "stagger" }
-local function matchesStun(name)
-    name = name:lower()
-    for _, p in ipairs(STUN_PATTERNS) do if name:find(p, 1, true) then return true end end
+-- Config Save / Load via JSON (executor filesystem safe wrappers)
+local function SaveConfigToDisk()
+    if type(writefile) ~= "function" or not HttpService then
+        return false, "writefile not supported"
+    end
+    local ok, err = pcall(function()
+        if type(isfolder) == "function" and type(makefolder) == "function" then
+            if not isfolder(Config.Settings.ConfigFolder) then
+                makefolder(Config.Settings.ConfigFolder)
+            end
+        end
+        local json = HttpService:JSONEncode(Config)
+        writefile(Config.Settings.ConfigFile, json)
+    end)
+    return ok, err
+end
+
+local function LoadConfigFromDisk()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" or not HttpService then
+        return false, "readfile/isfile not supported"
+    end
+    local ok, err = pcall(function()
+        if not isfile(Config.Settings.ConfigFile) then
+            error("Config file does not exist yet")
+        end
+        local raw = readfile(Config.Settings.ConfigFile)
+        local decoded = HttpService:JSONDecode(raw)
+        if type(decoded) == "table" then
+            for section, values in pairs(decoded) do
+                if type(Config[section]) == "table" and type(values) == "table" then
+                    for k, v in pairs(values) do
+                        Config[section][k] = v
+                    end
+                end
+            end
+        end
+    end)
+    return ok, err
+end
+
+-- ============================================================================
+-- [SEC 3] COMBAT CORE (AUTO BLOCK 5-HIT, POST-HIT RECOVERY, PARRY, LEARN MODE)
+-- ============================================================================
+local NotifyToast -- Forward declaration from UI Library
+
+local function GetPingSeconds()
+    local pingSec = 0.065
+    pcall(function()
+        if Stats and Stats.Network and Stats.Network.ServerStatsItem then
+            local dataPing = Stats.Network.ServerStatsItem["Data Ping"]
+            if dataPing then
+                pingSec = math.clamp(dataPing:GetValue() / 1000, 0.015, 0.350)
+            end
+        end
+    end)
+    return pingSec * Config.Combat.PingMultiplier
+end
+
+local function GetCharacterParts(plrOrModel)
+    local char = plrOrModel
+    if plrOrModel and plrOrModel:IsA("Player") then
+        char = plrOrModel.Character
+    end
+    if not char then return nil, nil, nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return char, hrp, hum
+end
+
+-- Check if local player is currently stunned / in hit-recovery
+local function IsLocalPlayerInHitstun(char, hum)
+    if not char or not hum then return false end
+    if hum.PlatformStand or hum.Sit then return true end
+    if hum.WalkSpeed <= 4 then return true end
+
+    local stunKeywords = { "Stun", "Hitstun", "Hit", "Ragdoll", "Knocked", "ComboStun", "Stunned" }
+    for _, kw in ipairs(stunKeywords) do
+        if char:GetAttribute(kw) == true or char:FindFirstChild(kw) then
+            return true
+        end
+    end
     return false
 end
 
-local function localRefs()
-    local char = LP.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if hum and root and hum.Health > 0 then return char, hum, root end
-end
-
-local function refreshPing()
-    local ok, v = pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() / 1000 end)
-    if not ok or type(v) ~= "number" then
-        ok, v = pcall(function() return LP:GetNetworkPing() * 2 end)
+-- Check if target is valid hostile fighter
+local function IsValidAttacker(model)
+    if not model or not LocalPlayer or model == LocalPlayer.Character then
+        return false
     end
-    if ok and type(v) == "number" then State.Ping = v end
-end
-local function pingComp()
-    if not Cfg.Detect.PingComp then return 0 end
-    return math.clamp(State.Ping * Cfg.Detect.PingScale, 0, 0.35)
-end
-
--- Hitstun heuristics (cached at 20 Hz)
-local function updateStun(now)
-    if now - Combat.lastStun < 0.05 then return end
-    Combat.lastStun = now
-    local char, hum = localRefs()
-    if not char then State.Stunned = true return end
-    local s = hum.PlatformStand or hum.WalkSpeed <= 0.5
-    if not s then
-        local st = hum:GetState()
-        s = st == Enum.HumanoidStateType.Ragdoll or st == Enum.HumanoidStateType.FallingDown
-            or st == Enum.HumanoidStateType.Physics
+    local _, hrp, hum = GetCharacterParts(model)
+    if not hrp or not hum or hum.Health <= 0 then
+        return false
     end
-    if not s then
-        for _, c in ipairs(char:GetChildren()) do
-            if matchesStun(c.Name) then
-                if c:IsA("BoolValue") then s = c.Value
-                elseif c:IsA("NumberValue") or c:IsA("IntValue") then s = c.Value > 0
-                else s = true end
-                if s then break end
-            end
+    if Config.Combat.IgnoreTeamAndDead then
+        local targetPlr = Players and Players:GetPlayerFromCharacter(model)
+        if targetPlr and LocalPlayer.Team and targetPlr.Team == LocalPlayer.Team then
+            return false
+        end
+        if model:GetAttribute("Knocked") == true or model:FindFirstChild("Knocked") then
+            return false
         end
     end
-    if not s then
-        for k, v in pairs(char:GetAttributes()) do
-            if matchesStun(k) and (v == true or (type(v) == "number" and v > 0)) then s = true break end
-        end
-    end
-    State.Stunned = s and true or false
-end
-
-local function attackerValid(plr, char)
-    if plr == LP then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return false end                  -- dead / inactive
-    if char:FindFirstChildOfClass("ForceField") then return false end
-    if Cfg.Detect.IgnoreTeam and plr.Team ~= nil and plr.Team == LP.Team then return false end
-    if Cfg.Detect.IgnoreFriends and Combat.Friends[plr.UserId] then return false end
     return true
 end
 
--- distance + facing check; returns ok, distance
-local function inRange(attRoot, myRoot)
-    local off = myRoot.Position - attRoot.Position
-    local dist = off.Magnitude
-    if dist > Cfg.Detect.MaxDistance then return false, dist end
-    if Cfg.Detect.FacingCheck and dist > 4.5 then
-        local flat = Vector3.new(off.X, 0, off.Z)
-        if flat.Magnitude > 0.01 then
-            local look = attRoot.CFrame.LookVector
-            look = Vector3.new(look.X, 0, look.Z)
-            if look.Magnitude > 0.01 and look.Unit:Dot(flat.Unit) < Cfg.Detect.FacingThreshold then
-                return false, dist
-            end
-        end
-    end
-    return true, dist
+-- Normalize AnimationId string to numeric ID or clean asset string
+local function CleanAnimId(rawId)
+    if not rawId then return "" end
+    local digits = string.match(tostring(rawId), "%d+")
+    return digits or tostring(rawId)
 end
 
----------------------------------------------------------------- Block controller
-function Block.isHeld() return Input.held.Block ~= nil end
-
--- Extend the hold window. chain >= 2 bridges the gap to the next hit of a combo.
-function Block.request(now, tth, t)
-    local c = Cfg.Block
-    local chain = (t and t.chain) or 1
-    local untilT = now + math.max(tth, 0) + c.Hold
-    if chain >= 2 and chain < c.ComboMax then untilT = untilT + c.ComboBridge end
-    if untilT > Block.holdUntil then Block.holdUntil = untilT end
-end
-function Block.update(now)
-    local want = now < Block.holdUntil
-    if want and not Input.held.Block then Input.press("Block")
-    elseif not want and Input.held.Block then Input.release("Block") end
-end
-
----------------------------------------------------------------- Dodge
-function Combat.dodgeReady(now) return now - Combat.dodgeLast >= Cfg.Dodge.Cooldown end
-function Combat.doDodge(now)
-    Combat.dodgeLast = now
-    Input.tap("Dodge", Cfg.Dodge.Tap)
-end
-
----------------------------------------------------------------- Track handling
-function Combat.onTrack(plr, char, track)
-    if State.Unloaded then return end
-    local okA, rawId = pcall(function() return track.Animation.AnimationId end)
-    rawId = okA and tostring(rawId) or ""
-    local key = rawId:match("%d+") or rawId
-    if track.Looped then return end
-
-    local _, _, myRoot = localRefs()
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local dist = (myRoot and hrp) and (myRoot.Position - hrp.Position).Magnitude or math.huge
-    local pr = track.Priority
-    local idle = pr == Enum.AnimationPriority.Idle or pr == Enum.AnimationPriority.Movement
-        or pr == Enum.AnimationPriority.Core
-
-    -- Learn mode: log + remember tracks so that a received hit can be attributed
-    if State.Learn and dist <= 60 then
-        log("LEARN | %s | id=%s | len=%.2fs | speed=%.2f | prio=%s | dist=%.1f | learned=%s",
-            plr.Name, key, track.Length, track.Speed, pr.Name, dist, tostring(Cfg.Learned[key] ~= nil))
-        if not idle then
-            Combat.LearnTracks[track] = { key = key, plr = plr, char = char, start = os.clock() }
-        end
-    end
-
-    -- Threat filter
-    if Cfg.Detect.Filter == "Learned" then
-        if not Cfg.Learned[key] then return end
-    elseif idle then return end
-    if track.Length < 0.1 or not attackerValid(plr, char) then return end
-    if dist > Cfg.Detect.MaxDistance * 2 + 10 then return end
-
-    local now = os.clock()
-    local ch = Combat.Chains[plr]
-    if ch and now - ch.lastStart <= Cfg.Block.ComboGap then
-        ch.count = (ch.count >= Cfg.Block.ComboMax) and 1 or (ch.count + 1)
-    else
-        ch = { count = 1 }
-        Combat.Chains[plr] = ch
-    end
-    ch.lastStart = now
-
-    local learned = Cfg.Learned[key]
-    local hitPos = learned and learned.hit or math.clamp(track.Length * Cfg.Detect.HitFraction, 0.08, 0.55)
-    Combat.Active[track] = { plr = plr, char = char, track = track, id = key, hitPos = hitPos, chain = ch.count }
-end
-
--- Attribute a received hit to the most recent nearby attack animation (Learn mode)
-function Combat.learnHit(now)
-    local _, _, myRoot = localRefs()
-    if not myRoot then return end
-    local best, bestInfo
-    for track, info in pairs(Combat.LearnTracks) do
-        local hrp = info.char:FindFirstChild("HumanoidRootPart")
-        if track.IsPlaying and hrp and (hrp.Position - myRoot.Position).Magnitude <= 20 and now - info.start < 1.5 then
-            if not bestInfo or info.start > bestInfo.start then best, bestInfo = track, info end
-        end
-    end
-    if not best then return end
-    local tp = best.TimePosition
-    local e = Cfg.Learned[bestInfo.key]
-    if e then
-        e.hit = (e.hit * e.n + tp) / (e.n + 1)
-        e.n = math.min(e.n + 1, 8)
-    else
-        Cfg.Learned[bestInfo.key] = { hit = tp, n = 1 }
-    end
-    log("LEARN HIT | %s | id=%s | hit@%.3f (anim time) | real=%.3fs after start | speed=%.2f",
-        bestInfo.plr.Name, bestInfo.key, tp, now - bestInfo.start, best.Speed)
-    if UI.UpdateLearned then UI.UpdateLearned() end
-end
-
-function Combat.onDamaged(now)
-    Combat.recoveryUntil = now + Cfg.Block.RecoveryWindow
-    if State.Learn then Combat.learnHit(now) end
-end
-
-function Combat.clear()
-    table.clear(Combat.Active)
-    table.clear(Combat.LearnTracks)
-    table.clear(Combat.Chains)
-end
-
----------------------------------------------------------------- Main step (Heartbeat)
-function Combat.step(now)
-    if now - Combat.lastPing > 0.5 then Combat.lastPing = now; refreshPing() end
-    Input.watchdog(now)
-
-    local char, _, myRoot = localRefs()
-    if not char then
-        Combat.clear()
-        Block.holdUntil = 0
-        Block.update(now)
-        return
-    end
-    updateStun(now)
-
-    local pc = pingComp()
-    local bLead, dLead = Cfg.Block.Lead + pc, Cfg.Dodge.Lead + pc
-    local blockOn, dodgeOn = Cfg.Block.Enabled, Cfg.Dodge.Enabled
-    local closeThreat = nil
-
-    for track, t in pairs(Combat.Active) do
-        local hrp = t.char.Parent and t.char:FindFirstChild("HumanoidRootPart")
-        if not track.IsPlaying or not hrp or not attackerValid(t.plr, t.char) then
-            Combat.Active[track] = nil
-        else
-            local ok, dist = inRange(hrp, myRoot)
-            local speed = math.max(track.Speed, 0.05)            -- animation speed aware
-            local tth = (t.hitPos - track.TimePosition) / speed  -- time to hit (s)
-
-            if ok and dist <= math.min(Cfg.Detect.MaxDistance, 12) and (tth > -0.3 or t.chain >= 2) then
-                closeThreat = t
-            end
-
-            if ok and not t.done and (blockOn or dodgeOn) then
-                -- 1) decide plan once the hit is close enough
-                if not t.plan then
-                    if tth < -0.15 then
-                        t.done = true -- we saw this attack too late
-                    elseif tth <= math.max(bLead, dLead) then
-                        if dodgeOn and Combat.dodgeReady(now) then t.plan = "dodge"
-                        elseif blockOn then t.plan = "block"
-                        else t.done = true end
-                    end
-                end
-                -- 2) dodge execution (with fallback to block)
-                if t.plan == "dodge" and not t.done and tth <= dLead then
-                    if not State.Stunned and Combat.dodgeReady(now) then
-                        Combat.doDodge(now)
-                        t.done = true
-                    elseif blockOn and (Cfg.Dodge.Fallback or State.Stunned) then
-                        t.plan = "block"
-                    else
-                        t.done = true
-                    end
-                end
-                -- 3) block execution; hitstun -> defer instead of wasting the reaction
-                if t.plan == "block" and not t.done and tth <= bLead then
-                    if State.Stunned and Cfg.Block.Recovery then
-                        if not t.deferred then t.deferred = true; t.deferAt = now end
-                        local chain = Combat.Chains[t.plr]
-                        local chaining = chain and chain.count >= 2 and now - chain.lastStart <= Cfg.Block.ComboGap
-                        if now - t.deferAt > Cfg.Block.RecoveryWindow and not chaining then t.done = true end
-                    else
-                        Block.request(now, tth, t) -- if deferred, tth <= 0 -> press immediately
-                        t.done = true
-                    end
-                end
-            elseif ok and t.done and t.plan == "block" and Block.isHeld() and t.chain >= 2 then
-                -- combo sustain: keep block alive while this attacker keeps swinging
-                Block.request(now, 0.12 - Cfg.Block.Hold, t)
-            end
-        end
-    end
-
-    -- Post-hit recovery: just got hit, window opened again, enemy still pressing -> block now
-    if blockOn and Cfg.Block.Recovery and now < Combat.recoveryUntil and closeThreat
-        and not State.Stunned and not Block.isHeld() and now >= Block.holdUntil then
-        Block.request(now, 0, closeThreat)
-    end
-    -- Stun just ended while we still need block -> re-press (game dropped the old press)
-    if Cfg.Block.Recovery and State.PrevStunned and not State.Stunned and Input.held.Block and now < Block.holdUntil then
-        Input.release("Block")
-    end
-    State.PrevStunned = State.Stunned
-
-    Block.update(now)
-
-    for p, c in pairs(Combat.Chains) do
-        if now - c.lastStart > 5 then Combat.Chains[p] = nil end
-    end
-    for track in pairs(Combat.LearnTracks) do
-        if not track.IsPlaying then Combat.LearnTracks[track] = nil end
-    end
-end
-
----------------------------------------------------------------- Player hooks
-function Combat.hookPlayer(plr)
-    if plr == LP or Combat.Hooks[plr] then return end
-    local h = { persist = Maid.new(), char = nil }
-    Combat.Hooks[plr] = h
-
-    task.spawn(function()
-        local ok, f = pcall(LP.IsFriendsWith, LP, plr.UserId)
-        if ok then Combat.Friends[plr.UserId] = f end
-    end)
-
-    local function onChar(char)
-        if h.char then h.char:Destroy() end
-        local cm = Maid.new()
-        h.char = cm
-        task.spawn(function()
-            local hum = char:WaitForChild("Humanoid", 8)
-            if not hum or State.Unloaded then return end
-            local animator = hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 5)
-            if not animator or State.Unloaded then return end
-            cm:Add(animator.AnimationPlayed:Connect(function(track)
-                local ok, err = pcall(Combat.onTrack, plr, char, track)
-                if not ok then log("onTrack error: %s", tostring(err)) end
-            end))
-        end)
-    end
-    if plr.Character then onChar(plr.Character) end
-    h.persist:Add(plr.CharacterAdded:Connect(onChar))
-end
-function Combat.unhookPlayer(plr)
-    local h = Combat.Hooks[plr]
-    if not h then return end
-    h.persist:Destroy()
-    if h.char then h.char:Destroy() end
-    Combat.Hooks[plr] = nil
-end
-
--- Local character: damage detection + death cleanup
-local charMaid = Maid.new()
-MainMaid:Add(charMaid)
-local function hookLocalCharacter(char)
-    charMaid:Clean()
-    Input.releaseAll()
-    Block.holdUntil = 0
-    Combat.clear()
-    task.spawn(function()
-        local hum = char:WaitForChild("Humanoid", 10)
-        if not hum or State.Unloaded then return end
-        local last = hum.Health
-        charMaid:Add(hum.HealthChanged:Connect(function(h)
-            if h < last - 0.01 then Combat.onDamaged(os.clock()) end
-            last = h
-        end))
-        charMaid:Add(hum.Died:Connect(function()
-            Block.holdUntil = 0
-            Input.releaseAll()
-            Combat.clear()
-        end))
-    end)
-end
-
--- Feature toggle side effects (shared by UI click and hotkey)
-function Combat.onFeatureToggle(name, v)
-    if name == "Auto Block" and not v then
-        Block.holdUntil = 0
-        Input.release("Block")
-    end
-    UI.Toast(name .. ": " .. (v and "ON" or "OFF"), v and "on" or "off")
-end
-function Combat.testBlock()
-    Block.holdUntil = os.clock() + 0.8
-    UI.Toast("Block test (0.8s)", "info")
-end
-function Combat.testDodge()
-    Combat.doDodge(os.clock())
-    UI.Toast("Dodge test", "info")
-end
-
---==============================================================================
--- CONFIG I/O
---==============================================================================
-local ConfigIO = { Folder = "RevengersX", File = "Config.json" }
-function ConfigIO.available()
-    return Exec.writefile ~= nil and Exec.readfile ~= nil and Exec.isfile ~= nil
-end
-function ConfigIO.path() return ConfigIO.Folder .. "/" .. ConfigIO.File end
-
-function ConfigIO.save()
-    if not ConfigIO.available() then UI.Toast("Config: file API unavailable", "err") return end
-    local ok, err = pcall(function()
-        if Exec.isfolder and Exec.makefolder and not Exec.isfolder(ConfigIO.Folder) then
-            Exec.makefolder(ConfigIO.Folder)
-        end
-        Exec.writefile(ConfigIO.path(), HttpService:JSONEncode(Cfg))
-    end)
-    UI.Toast(ok and "Config saved" or "Save failed", ok and "on" or "err")
-    if not ok then log("save error: %s", tostring(err)) end
-end
-
-function ConfigIO.load()
-    if not ConfigIO.available() then UI.Toast("Config: file API unavailable", "err") return end
-    local ok, err = pcall(function()
-        if not Exec.isfile(ConfigIO.path()) then error("no config file yet", 0) end
-        local data = HttpService:JSONDecode(Exec.readfile(ConfigIO.path()))
-        deepMerge(Cfg, data)
-    end)
-    if not ok then UI.Toast("Load failed: " .. tostring(err), "err") return end
-    Input.normalize()
-    UI.ApplyTheme()
-    UI.RefreshAll()
-    UI.Toast("Config loaded", "on")
-end
-
---==============================================================================
--- 5. UI LIBRARY
---==============================================================================
-local P = {
-    Panel = Color3.fromRGB(19, 19, 26), Bg = Color3.fromRGB(13, 13, 18),
-    Elem = Color3.fromRGB(26, 26, 35), Hover = Color3.fromRGB(34, 34, 46),
-    Stroke = Color3.fromRGB(46, 46, 62), Text = Color3.fromRGB(232, 232, 242), Sub = Color3.fromRGB(138, 138, 158),
+-- Evaluate if an AnimationTrack is an offensive non-looped combat swing
+local NonCombatTracks = {
+    ["180435571"] = true, ["180435792"] = true, ["125750702"] = true,
+    ["180426354"] = true, ["180436148"] = true, ["507766388"] = true,
+    ["507766666"] = true, ["507767714"] = true, ["507765000"] = true,
 }
 
-local function new(class, props, kids)
-    local o = Instance.new(class)
-    local parent
-    for k, v in pairs(props or {}) do
-        if k == "Parent" then parent = v else o[k] = v end
+local function IsCombatAnimationTrack(track)
+    if not track or not track.Animation then return false, "" end
+    local animId = CleanAnimId(track.Animation.AnimationId)
+    if animId == "" or NonCombatTracks[animId] then return false, animId end
+
+    if Config.Combat.FilterMode == "WhitelistOnly" then
+        return (Config.AttackWhitelist[animId] == true or Config.LearnedTimings[animId] ~= nil), animId
     end
-    for _, kid in ipairs(kids or {}) do kid.Parent = o end
-    if parent then o.Parent = parent end
-    return o
-end
-local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r) }) end
-local function uiStroke(c, t)
-    return new("UIStroke", { Color = c, Thickness = t or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
-end
-local function label(props)
-    local p = { BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = P.Text,
-        TextXAlignment = Enum.TextXAlignment.Left }
-    for k, v in pairs(props) do p[k] = v end
-    return new("TextLabel", p)
-end
-local function accentHook(f) table.insert(UI.AccentHooks, f); pcall(f, UI.Accent) end
-local function accentSeq(c)
-    return ColorSequence.new({
-        ColorSequenceKeypoint.new(0, c),
-        ColorSequenceKeypoint.new(0.5, c:Lerp(Color3.new(1, 1, 1), 0.6)),
-        ColorSequenceKeypoint.new(1, c),
-    })
+
+    if track.Looped then return false, animId end
+    local len = track.Length
+    if len <= 0.08 or len > 3.80 then return false, animId end
+
+    local prio = track.Priority
+    if prio == Enum.AnimationPriority.Core or prio == Enum.AnimationPriority.Idle or prio == Enum.AnimationPriority.Movement then
+        return false, animId
+    end
+    return true, animId
 end
 
-function UI.SetAccent(c, skipSync)
-    UI.Accent = c
-    Cfg.Theme.Accent = toHex(c)
-    for _, f in ipairs(UI.AccentHooks) do pcall(f, c) end
-    if not skipSync and UI.SyncTheme then pcall(UI.SyncTheme) end
+-- Start or extend smart block hold (supports 4-5 hit strings without dropping mid-gap)
+local function StartOrExtendBlock(holdDuration, reason)
+    if State.Unloaded then return end
+    local now = os.clock()
+    local duration = math.max(holdDuration or 0.30, Config.Combat.MinBlockDuration)
+    local targetRelease = now + duration
+
+    if targetRelease > State.BlockReleaseTimestamp then
+        State.BlockReleaseTimestamp = targetRelease
+    end
+
+    if not State.IsBlocking then
+        State.IsBlocking = true
+        State.BlockStartTimestamp = now
+        SendKeyDown(Config.Settings.BlockKey)
+        TryFireCombatRemote("Block", true)
+    end
 end
 
-local function mountGui(gui)
-    if Exec.protect then pcall(Exec.protect, gui) end
-    local candidates = {}
-    if Exec.gethui then table.insert(candidates, function() return Exec.gethui() end) end
-    if CoreGui then table.insert(candidates, function() return CoreGui end) end
-    table.insert(candidates, function() return LP:WaitForChild("PlayerGui", 5) end)
-    for _, get in ipairs(candidates) do
-        local ok, parent = pcall(get)
-        if ok and parent then
-            local ok2 = pcall(function() gui.Parent = parent end)
-            if ok2 and gui.Parent then return true end
+local function StopBlock()
+    if State.IsBlocking then
+        State.IsBlocking = false
+        State.BlockReleaseTimestamp = 0
+        SendKeyUp(Config.Settings.BlockKey)
+        TryFireCombatRemote("Block", false)
+    end
+end
+
+-- Execute quick Dodge / Parry tap with automatic fallback to Auto Block if on cooldown
+local function TryExecuteDodgeOrFallback(holdFallbackDuration)
+    if State.Unloaded then return end
+    local now = os.clock()
+    local dodgeReady = Config.Combat.AutoDodge
+        and not State.IsDodging
+        and ((now - State.LastDodgeTimestamp) >= Config.Combat.DodgeCooldown)
+
+    if dodgeReady then
+        State.IsDodging = true
+        State.LastDodgeTimestamp = now
+
+        if State.IsBlocking then
+            StopBlock()
+        end
+
+        SendKeyDown(Config.Settings.DodgeKey)
+        TryFireCombatRemote("Dodge", true)
+
+        task.delay(Config.Combat.DodgeTapDuration, function()
+            SendKeyUp(Config.Settings.DodgeKey)
+            TryFireCombatRemote("Dodge", false)
+            State.IsDodging = false
+        end)
+        return "Dodged"
+    end
+
+    -- Automatic fallback to Auto Block if Dodge is on cooldown or disabled
+    if Config.Combat.AutoBlock and (not Config.Combat.AutoDodge or Config.Combat.DodgeFallbackToBlock) then
+        StartOrExtendBlock(holdFallbackDuration, "DodgeCooldownFallback")
+        return "Blocked"
+    end
+    return "None"
+end
+
+-- Core Heartbeat Combat Loop
+local function StepCombatCore()
+    if State.Unloaded then return end
+    local now = os.clock()
+
+    -- 1. Anti-Stuck Key Watchdog & Scheduled Block Release
+    for keyName, pressTime in pairs(HeldKeys) do
+        if (now - pressTime) > Config.Settings.MaxKeyHoldWatchdog then
+            SendKeyUp(keyName)
         end
     end
-    return false
+
+    if State.IsBlocking and now >= State.BlockReleaseTimestamp then
+        StopBlock()
+    end
+
+    local myChar, myHRP, myHum = GetCharacterParts(LocalPlayer)
+    if not myChar or not myHRP or not myHum or myHum.Health <= 0 then
+        if State.IsBlocking then StopBlock() end
+        return
+    end
+
+    -- 2. Track HP changes & Hitstun state for Post-Hit Recovery
+    if State.LastHealth and myHum.Health < State.LastHealth then
+        State.LastDamageTakenTimestamp = now
+        -- Learn Mode: record exact animation fraction at the moment damage landed
+        if Config.Combat.LearnMode then
+            for track, meta in pairs(State.TrackedTracks) do
+                if track.IsPlaying and meta.Distance and meta.Distance <= Config.Combat.MaxDistance then
+                    local frac = math.clamp(track.TimePosition / math.max(track.Length, 0.01), 0.10, 0.90)
+                    Config.LearnedTimings[meta.AnimId] = frac
+                    print(string.format(
+                        "[RevengersX Learn] HIT CONFIRMED | ID: %s | HitFrac: %.2f | Speed: %.2f | Dist: %.1f",
+                        meta.AnimId, frac, track.Speed, meta.Distance
+                    ))
+                end
+            end
+        end
+    end
+    State.LastHealth = myHum.Health
+
+    local currentlyInStun = IsLocalPlayerInHitstun(myChar, myHum)
+    local justRecoveredFromStun = State.WasInHitstun and not currentlyInStun
+    State.WasInHitstun = currentlyInStun
+
+    -- Reset combo counter if enemy stopped swinging for > 1.15s
+    if (now - State.LastEnemySwingTimestamp) > 1.15 then
+        State.ActiveComboCount = 0
+    end
+
+    -- 3. Scan nearby fighters and their playing AnimationTracks
+    local pingSec = GetPingSeconds()
+    local threatDetectedClose = false
+    local longestComboHoldNeeded = 0
+
+    local candidates = {}
+    if Players then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                table.insert(candidates, plr.Character)
+            end
+        end
+    end
+    -- Also inspect Workspace NPC/Dummy fighters
+    local ws = SafeGetService("Workspace")
+    if ws then
+        for _, child in ipairs(ws:GetChildren()) do
+            if child:IsA("Model") and child ~= myChar and not Players:GetPlayerFromCharacter(child) then
+                if child:FindFirstChildOfClass("Humanoid") then
+                    table.insert(candidates, child)
+                end
+            end
+        end
+    end
+
+    for _, enemyModel in ipairs(candidates) do
+        if IsValidAttacker(enemyModel) then
+            local _, enemyHRP, enemyHum = GetCharacterParts(enemyModel)
+            local dist = (myHRP.Position - enemyHRP.Position).Magnitude
+
+            if dist <= Config.Combat.MaxDistance then
+                -- Facing check: is the attacker looking towards us?
+                local dirToMe = (myHRP.Position - enemyHRP.Position).Unit
+                local dot = enemyHRP.CFrame.LookVector:Dot(dirToMe)
+                local facingPassed = (not Config.Combat.FacingCheck) or (dot >= Config.Combat.FacingDotThreshold)
+
+                if facingPassed then
+                    local animator = enemyHum:FindFirstChildOfClass("Animator") or enemyHum
+                    local ok, playingTracks = pcall(function()
+                        return animator:GetPlayingAnimationTracks()
+                    end)
+
+                    if ok and playingTracks then
+                        for _, track in ipairs(playingTracks) do
+                            local isCombat, animId = IsCombatAnimationTrack(track)
+                            if isCombat then
+                                local speed = math.max(math.abs(track.Speed), 0.05)
+                                local length = math.max(track.Length, 0.10)
+                                local hitFraction = Config.LearnedTimings[animId] or 0.42
+                                local hitTimePos = length * hitFraction
+                                local remainingToImpact = (hitTimePos - track.TimePosition) / speed
+                                local remainingTotal = (length - track.TimePosition) / speed
+
+                                -- Register new swing in combo sequence
+                                if not State.TrackedTracks[track] then
+                                    State.TrackedTracks[track] = {
+                                        AnimId = animId,
+                                        StartClock = now,
+                                        Reacted = false,
+                                        Distance = dist,
+                                    }
+                                    State.LastEnemySwingTimestamp = now
+                                    State.ActiveComboCount = math.min(State.ActiveComboCount + 1, 5)
+
+                                    if Config.Combat.LearnMode then
+                                        print(string.format(
+                                            "[RevengersX Learn] SWING #%d | ID: %s | Len: %.2fs | Speed: %.2f | Prio: %s | Dist: %.1f",
+                                            State.ActiveComboCount, animId, length, speed, tostring(track.Priority.Name), dist
+                                        ))
+                                    end
+                                else
+                                    State.TrackedTracks[track].Distance = dist
+                                    State.LastEnemySwingTimestamp = now
+                                end
+
+                                threatDetectedClose = true
+                                local meta = State.TrackedTracks[track]
+
+                                -- Calculate hold window accounting for 4-5 hit combo chaining
+                                local comboBonus = (State.ActiveComboCount >= 2) and Config.Combat.ComboHoldExtension or 0.18
+                                local holdNeeded = math.max(remainingTotal + comboBonus, Config.Combat.MinBlockDuration)
+                                if holdNeeded > longestComboHoldNeeded then
+                                    longestComboHoldNeeded = holdNeeded
+                                end
+
+                                -- Effective reaction lead window (includes Ping + user LeadTime)
+                                local blockReactionWindow = Config.Combat.BlockLeadTime + pingSec
+                                local dodgeReactionWindow = Config.Combat.DodgeLeadTime + pingSec
+
+                                -- Standard pre-hit reaction
+                                if not meta.Reacted and remainingToImpact <= math.max(blockReactionWindow, dodgeReactionWindow) and remainingToImpact >= -0.08 then
+                                    meta.Reacted = true
+                                    if Config.Combat.AutoDodge then
+                                        TryExecuteDodgeOrFallback(holdNeeded)
+                                    elseif Config.Combat.AutoBlock then
+                                        StartOrExtendBlock(holdNeeded, "PreHit")
+                                    end
+                                end
+
+                                -- Combo / Post-Hit Recovery Mode:
+                                -- If impact window already passed while we were in hitstun/damaged,
+                                -- but the enemy attack or 5-hit string is STILL active near us, immediately raise/extend block
+                                if Config.Combat.PostHitRecovery and Config.Combat.AutoBlock then
+                                    local recentlyHit = (now - State.LastDamageTakenTimestamp) <= Config.Combat.PostHitWindow
+                                    local lateInSwing = (remainingToImpact < 0) and (remainingTotal > 0.04)
+                                    if (justRecoveredFromStun or recentlyHit or lateInSwing) and not State.IsDodging then
+                                        StartOrExtendBlock(holdNeeded, "PostHitRecovery")
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Keep block alive across small inter-hit gaps during an active 4-5 hit combo string
+    if State.IsBlocking and threatDetectedClose and State.ActiveComboCount >= 2 then
+        StartOrExtendBlock(longestComboHoldNeeded, "ComboBridge")
+    end
+
+    -- Cleanup finished AnimationTracks
+    for track, _ in pairs(State.TrackedTracks) do
+        if not track.IsPlaying then
+            State.TrackedTracks[track] = nil
+        end
+    end
 end
 
-local TAB_COUNT = 3
-local Tab = {}
-Tab.__index = Tab
+-- ============================================================================
+-- [SEC 4] CUSTOM DARK UI LIBRARY (TWEEN OPEN/CLOSE, DRAG, TOASTS, THEME)
+-- ============================================================================
+local UI = {
+    ScreenGui = nil,
+    MainFrame = nil,
+    ToastHolder = nil,
+    AccentElements = {}, -- { {Instance, Property} }
+    TabPages = {},
+    TabButtons = {},
+}
 
-function UI.Build()
-    local guid = safeGet(function() return HttpService:GenerateGUID(false) end) or "RevengersX"
-    local gui = new("ScreenGui", { Name = guid, ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 999,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
-    if not mountGui(gui) then error("[RevengersX] could not mount GUI") end
-    UI.Gui = gui
-    MainMaid:Add(gui)
+local function GetAccentColor3()
+    return Color3.fromRGB(Config.Theme.AccentR, Config.Theme.AccentG, Config.Theme.AccentB)
+end
 
-    -- Window (CanvasGroup allows smooth group fade)
-    local main = new("CanvasGroup", { Name = "Main", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromOffset(540, 450), BackgroundColor3 = P.Bg, BorderSizePixel = 0, GroupTransparency = 1,
-        Visible = false, Parent = gui }, { corner(10), uiStroke(P.Stroke, 1) })
-    local scale = new("UIScale", { Scale = 0.92, Parent = main })
-    UI.Main, UI.Scale = main, scale
+local function RegisterAccent(inst, prop)
+    table.insert(UI.AccentElements, { Instance = inst, Property = prop })
+    pcall(function()
+        inst[prop] = GetAccentColor3()
+    end)
+end
 
-    -- Header (drag handle)
-    local header = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = P.Panel, BorderSizePixel = 0, Parent = main })
-    local title = label({ Text = "REVENGERS X", Font = Enum.Font.GothamBlack, TextSize = 17, TextColor3 = Color3.new(1, 1, 1),
-        Position = UDim2.fromOffset(16, 6), Size = UDim2.fromOffset(200, 20), Parent = header })
-    local titleGrad = new("UIGradient", { Parent = title })
-    label({ Text = "Combat Suite  •  v1.0", TextSize = 11, TextColor3 = P.Sub, Position = UDim2.fromOffset(16, 25),
-        Size = UDim2.fromOffset(200, 14), Parent = header })
-    local close = new("TextButton", { Text = "×", Font = Enum.Font.GothamBold, TextSize = 22, TextColor3 = P.Sub,
-        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(30, 30),
-        BackgroundColor3 = P.Elem, AutoButtonColor = false, Parent = header }, { corner(6) })
-    close.MouseEnter:Connect(function() tween(close, TweenInfo.new(0.12), { TextColor3 = P.Text, BackgroundColor3 = P.Hover }) end)
-    close.MouseLeave:Connect(function() tween(close, TweenInfo.new(0.12), { TextColor3 = P.Sub, BackgroundColor3 = P.Elem }) end)
-    close.MouseButton1Click:Connect(function() UI.SetVisible(false) end)
+local function ApplyThemeUpdates()
+    local col = GetAccentColor3()
+    for _, item in ipairs(UI.AccentElements) do
+        if item.Instance and item.Instance.Parent then
+            pcall(function()
+                item.Instance[item.Property] = col
+            end)
+        end
+    end
+    if UI.MainFrame then
+        UI.MainFrame.BackgroundTransparency = Config.Theme.WindowTransparency
+    end
+end
 
-    local line = new("Frame", { Position = UDim2.fromOffset(0, 46), Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = Color3.new(1, 1, 1),
-        BorderSizePixel = 0, Parent = main })
-    local lineGrad = new("UIGradient", { Parent = line })
-    table.insert(UI.Gradients, titleGrad)
-    table.insert(UI.Gradients, lineGrad)
-    accentHook(function(c) titleGrad.Color = accentSeq(c); lineGrad.Color = accentSeq(c) end)
+local function CreateCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 6)
+    c.Parent = parent
+    return c
+end
 
-    -- Tab bar
-    local bar = new("Frame", { Position = UDim2.fromOffset(0, 48), Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = P.Panel,
-        BorderSizePixel = 0, Parent = main })
-    local indicator = new("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1 / TAB_COUNT, 0, 0, 2),
-        BorderSizePixel = 0, Parent = bar })
-    accentHook(function(c) indicator.BackgroundColor3 = c end)
-    UI.TabBar, UI.Indicator, UI.Tabs = bar, indicator, {}
-    UI.PageHost = new("Frame", { Position = UDim2.fromOffset(0, 82), Size = UDim2.new(1, 0, 1, -82), BackgroundTransparency = 1,
-        ClipsDescendants = true, Parent = main })
+local function CreateStroke(parent, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Color3.fromRGB(42, 45, 62)
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.Parent = parent
+    return s
+end
 
-    -- Dragging
-    local dragging, dragStart, startPos
-    MainMaid:Add(header.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            dragging, dragStart, startPos = true, i.Position, main.Position
-            local c; c = i.Changed:Connect(function()
-                if i.UserInputState == Enum.UserInputState.End then dragging = false; c:Disconnect() end
+-- Toast Notification System
+NotifyToast = function(message, duration)
+    if State.Unloaded or not UI.ToastHolder then return end
+    duration = duration or 2.2
+
+    local toast = Instance.new("Frame")
+    toast.Size = UDim2.new(1, 0, 0, 32)
+    toast.BackgroundColor3 = Color3.fromRGB(20, 23, 34)
+    toast.BackgroundTransparency = 1
+    toast.BorderSizePixel = 0
+    toast.Parent = UI.ToastHolder
+    CreateCorner(toast, 6)
+    local stroke = CreateStroke(toast, GetAccentColor3(), 1, 0.3)
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0, 3, 1, -8)
+    bar.Position = UDim2.new(0, 4, 0, 4)
+    bar.BackgroundColor3 = GetAccentColor3()
+    bar.BorderSizePixel = 0
+    bar.Parent = toast
+    CreateCorner(bar, 2)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -18, 1, 0)
+    lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextColor3 = Color3.fromRGB(235, 235, 245)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = tostring(message)
+    lbl.TextTransparency = 1
+    lbl.Parent = toast
+
+    if TweenService then
+        TweenService:Create(toast, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            BackgroundTransparency = 0.08
+        }):Play()
+        TweenService:Create(lbl, TweenInfo.new(0.2), { TextTransparency = 0 }):Play()
+    else
+        toast.BackgroundTransparency = 0.08
+        lbl.TextTransparency = 0
+    end
+
+    task.delay(duration, function()
+        if not toast or not toast.Parent then return end
+        if TweenService then
+            local tw = TweenService:Create(toast, TweenInfo.new(0.22), { BackgroundTransparency = 1 })
+            TweenService:Create(lbl, TweenInfo.new(0.22), { TextTransparency = 1 }):Play()
+            TweenService:Create(stroke, TweenInfo.new(0.22), { Transparency = 1 }):Play()
+            tw:Play()
+            tw.Completed:Wait()
+        end
+        if toast and toast.Parent then
+            toast:Destroy()
+        end
+    end)
+end
+
+-- Build Main Window
+local function CreateMainUI()
+    local parent = GetSafeGuiParent()
+    if not parent then return end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "RevengersX_CombatSuite"
+    sg.ResetOnSpawn = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = parent
+    UI.ScreenGui = sg
+
+    -- Toast Container (Top-Right)
+    local toastHolder = Instance.new("Frame")
+    toastHolder.Name = "ToastHolder"
+    toastHolder.Size = UDim2.new(0, 250, 0, 300)
+    toastHolder.Position = UDim2.new(1, -266, 0, 16)
+    toastHolder.BackgroundTransparency = 1
+    toastHolder.Parent = sg
+    local toastLayout = Instance.new("UIListLayout")
+    toastLayout.Padding = UDim.new(0, 6)
+    toastLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+    toastLayout.Parent = toastHolder
+    UI.ToastHolder = toastHolder
+
+    -- Main Window Frame
+    local main = Instance.new("Frame")
+    main.Name = "MainWindow"
+    main.Size = UDim2.new(0, 510, 0, 440)
+    main.Position = UDim2.new(0.5, -255, 0.5, -220)
+    main.BackgroundColor3 = Color3.fromRGB(15, 17, 25)
+    main.BackgroundTransparency = Config.Theme.WindowTransparency
+    main.BorderSizePixel = 0
+    main.ClipsDescendants = true
+    main.Parent = sg
+    CreateCorner(main, 10)
+    CreateStroke(main, Color3.fromRGB(45, 48, 68), 1, 0)
+    UI.MainFrame = main
+
+    -- Top Animated Accent Line
+    local topBar = Instance.new("Frame")
+    topBar.Size = UDim2.new(1, 0, 0, 3)
+    topBar.BorderSizePixel = 0
+    topBar.Parent = main
+    RegisterAccent(topBar, "BackgroundColor3")
+
+    local grad = Instance.new("UIGradient")
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(160, 190, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
+    })
+    grad.Parent = topBar
+
+    -- Header (Draggable)
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 40)
+    header.Position = UDim2.new(0, 0, 0, 3)
+    header.BackgroundColor3 = Color3.fromRGB(19, 22, 33)
+    header.BorderSizePixel = 0
+    header.Parent = main
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -120, 1, 0)
+    title.Position = UDim2.new(0, 14, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.TextColor3 = Color3.fromRGB(245, 245, 250)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "REVENGERS X  •  COMBAT SUITE"
+    title.Parent = header
+
+    local bindBadge = Instance.new("TextLabel")
+    bindBadge.Size = UDim2.new(0, 86, 0, 22)
+    bindBadge.Position = UDim2.new(1, -98, 0.5, -11)
+    bindBadge.BackgroundColor3 = Color3.fromRGB(26, 29, 44)
+    bindBadge.Font = Enum.Font.Code
+    bindBadge.TextSize = 11
+    bindBadge.TextColor3 = Color3.fromRGB(180, 185, 205)
+    bindBadge.Text = "[" .. Config.Settings.MenuKey .. "]"
+    bindBadge.Parent = header
+    CreateCorner(bindBadge, 5)
+    UI.MenuBindLabel = bindBadge
+
+    -- Smooth Dragging Logic on Header
+    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+    TrackConnection(header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
             end)
         end
     end))
-    MainMaid:Add(UserInputService.InputChanged:Connect(function(i)
-        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-            local d = i.Position - dragStart
-            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    TrackConnection(header.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end))
+    TrackConnection(UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
         end
     end))
 
-    -- Toast host
-    UI.ToastHolder = new("Frame", { AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16), Size = UDim2.fromOffset(270, 320),
-        BackgroundTransparency = 1, Parent = gui }, {
-        new("UIListLayout", { Padding = UDim.new(0, 6), VerticalAlignment = Enum.VerticalAlignment.Bottom,
-            HorizontalAlignment = Enum.HorizontalAlignment.Right, SortOrder = Enum.SortOrder.LayoutOrder }),
-    })
-
-    -- Title/gradient animation
-    MainMaid:Add(RunService.Heartbeat:Connect(function()
-        local t = os.clock()
-        local off = Cfg.Theme.AnimateTitle and Vector2.new(math.sin(t * 1.4) * 0.6, 0) or Vector2.zero
-        for _, g in ipairs(UI.Gradients) do g.Offset = off end
-    end))
-end
-
-local toastOrder = 0
-function UI.Toast(msg, kind)
-    if State.Unloaded or not UI.ToastHolder then return end
-    local col = kind == "on" and Color3.fromRGB(80, 220, 130) or kind == "off" and Color3.fromRGB(235, 85, 85)
-        or kind == "err" and Color3.fromRGB(255, 170, 60) or UI.Accent
-    toastOrder += 1
-    local holder = new("Frame", { Size = UDim2.new(1, 0, 0, 38), BackgroundTransparency = 1, LayoutOrder = toastOrder, Parent = UI.ToastHolder })
-    local card = new("CanvasGroup", { Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(60, 0), GroupTransparency = 1,
-        BackgroundColor3 = P.Panel, BorderSizePixel = 0, Parent = holder }, { corner(8), uiStroke(P.Stroke, 1) })
-    new("Frame", { Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = col, BorderSizePixel = 0, Parent = card })
-    label({ Text = tostring(msg), Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -20, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd, Parent = card })
-    tween(card, TweenInfo.new(0.25, Enum.EasingStyle.Quint), { Position = UDim2.fromOffset(0, 0), GroupTransparency = 0 })
-
-    -- keep at most 5 toasts
-    local kids = {}
-    for _, k in ipairs(UI.ToastHolder:GetChildren()) do if k:IsA("Frame") then table.insert(kids, k) end end
-    if #kids > 5 then table.sort(kids, function(a, b) return a.LayoutOrder < b.LayoutOrder end); kids[1]:Destroy() end
-
-    task.delay(2.4, function()
-        if State.Unloaded or not holder.Parent then return end
-        tween(card, TweenInfo.new(0.25), { Position = UDim2.fromOffset(60, 0), GroupTransparency = 1 })
-        task.delay(0.3, function() if holder.Parent then holder:Destroy() end end)
-    end)
-end
-
-local visToken = 0
-function UI.SetVisible(v)
-    if State.Unloaded or not UI.Main then return end
-    State.MenuOpen = v
-    visToken += 1
-    local my = visToken
-    if v then
-        UI.Main.Visible = true
-        tween(UI.Scale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
-        tween(UI.Main, TweenInfo.new(0.22), { GroupTransparency = Cfg.Theme.Transparency })
-    else
-        tween(UI.Scale, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { Scale = 0.94 })
-        tween(UI.Main, TweenInfo.new(0.2), { GroupTransparency = 1 })
-        task.delay(0.22, function()
-            if my == visToken and not State.Unloaded and UI.Main then UI.Main.Visible = false end
-        end)
-    end
-end
-function UI.ToggleMenu() UI.SetVisible(not State.MenuOpen) end
-
-function UI.ApplyTheme()
-    local c = fromHex(Cfg.Theme.Accent) or Color3.fromRGB(229, 51, 79)
-    UI.SetAccent(c, false)
-    if State.MenuOpen and UI.Main then UI.Main.GroupTransparency = Cfg.Theme.Transparency end
-end
-
-function UI.RefreshAll()
-    for _, e in pairs(UI.Elements) do
-        if type(e) == "table" and e.Refresh then pcall(e.Refresh) end
-    end
-end
-
----------------------------------------------------------------- Tabs
-function UI.AddTab(name)
-    local idx = #UI.Tabs + 1
-    local btn = new("TextButton", { Text = name:upper(), Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = P.Sub,
-        Position = UDim2.new((idx - 1) / TAB_COUNT, 0, 0, 0), Size = UDim2.new(1 / TAB_COUNT, 0, 1, -2),
-        BackgroundTransparency = 1, AutoButtonColor = false, Parent = UI.TabBar })
-    local page = new("ScrollingFrame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
-        ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false, Parent = UI.PageHost }, {
-        new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
-        new("UIPadding", { PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 12), PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 14) }),
-    })
-    accentHook(function(c) page.ScrollBarImageColor3 = c end)
-
-    local tab = setmetatable({ Page = page, HeaderBtn = btn, Order = 0, Index = idx }, Tab)
-    UI.Tabs[idx] = tab
-    btn.MouseButton1Click:Connect(function() UI.SelectTab(idx) end)
-    if idx == 1 then UI.SelectTab(1, true) end
-    return tab
-end
-
-function UI.SelectTab(idx, instant)
-    for i, t in ipairs(UI.Tabs) do
-        t.Page.Visible = (i == idx)
-        tween(t.HeaderBtn, TweenInfo.new(0.15), { TextColor3 = i == idx and P.Text or P.Sub })
-    end
-    tween(UI.Indicator, TweenInfo.new(instant and 0 or 0.25, Enum.EasingStyle.Quint), { Position = UDim2.new((idx - 1) / TAB_COUNT, 0, 1, 0) })
-end
-
-local function row(tab, h)
-    tab.Order += 1
-    return new("Frame", { Size = UDim2.new(1, 0, 0, h or 34), BackgroundColor3 = P.Elem, BorderSizePixel = 0,
-        LayoutOrder = tab.Order, Parent = tab.Page }, { corner(6) })
-end
-
-function Tab:Section(name)
-    self.Order += 1
-    local l = label({ Text = name:upper(), Font = Enum.Font.GothamBold, TextSize = 11, Size = UDim2.new(1, 0, 0, 22),
-        LayoutOrder = self.Order, Parent = self.Page })
-    accentHook(function(c) l.TextColor3 = c end)
-end
-
-function Tab:Label(text)
-    local r = row(self, 28)
-    local l = label({ Text = text, TextSize = 12, TextColor3 = P.Sub, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -24, 1, 0), Parent = r })
-    return { SetText = function(_, s) l.Text = s end }
-end
-
-function Tab:Toggle(o)
-    local r = row(self, 34)
-    label({ Text = o.Name, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -70, 1, 0), Parent = r })
-    local pill = new("Frame", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(38, 20),
-        BackgroundColor3 = P.Stroke, BorderSizePixel = 0, Parent = r }, { corner(10) })
-    local knob = new("Frame", { Position = UDim2.fromOffset(3, 3), Size = UDim2.fromOffset(14, 14), BackgroundColor3 = Color3.new(1, 1, 1),
-        BorderSizePixel = 0, Parent = pill }, { corner(7) })
-    local btn = new("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = r })
-    local obj = {}
-    local function paint(animate)
-        local on = o.Table[o.Key]
-        local ti = TweenInfo.new(animate and 0.16 or 0)
-        tween(pill, ti, { BackgroundColor3 = on and UI.Accent or P.Stroke })
-        tween(knob, ti, { Position = on and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3) })
-    end
-    function obj.Get() return o.Table[o.Key] end
-    function obj.Set(_, v, silent)
-        o.Table[o.Key] = v and true or false
-        paint(true)
-        if o.Callback and not silent then pcall(o.Callback, o.Table[o.Key]) end
-    end
-    function obj.Refresh() paint(false) end
-    btn.MouseButton1Click:Connect(function() obj:Set(not o.Table[o.Key]) end)
-    accentHook(function() paint(false) end)
-    return obj
-end
-
-function Tab:Slider(o)
-    local r = row(self, 46)
-    label({ Text = o.Name, Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -90, 0, 16), Parent = r })
-    local val = label({ TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = P.Sub, AnchorPoint = Vector2.new(1, 0),
-        Position = UDim2.new(1, -12, 0, 6), Size = UDim2.fromOffset(80, 16), Parent = r })
-    local track = new("Frame", { Position = UDim2.new(0, 12, 1, -14), Size = UDim2.new(1, -24, 0, 4), BackgroundColor3 = P.Stroke,
-        BorderSizePixel = 0, Parent = r }, { corner(2) })
-    local fill = new("Frame", { Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, Parent = track }, { corner(2) })
-    local knob = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromOffset(12, 12),
-        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Parent = track }, { corner(6) })
-    local hit = new("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = r })
-    local dec = o.Step >= 1 and 0 or o.Step >= 0.1 and 1 or o.Step >= 0.01 and 2 or 3
-    local obj = {}
-    local function paint()
-        local v = o.Table[o.Key]
-        local a = math.clamp((v - o.Min) / (o.Max - o.Min), 0, 1)
-        fill.Size = UDim2.fromScale(a, 1)
-        knob.Position = UDim2.fromScale(a, 0.5)
-        val.Text = string.format("%." .. dec .. "f", v) .. (o.Suffix or "")
-    end
-    local function setFrom(x)
-        local a = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
-        local v = o.Min + a * (o.Max - o.Min)
-        v = math.floor(v / o.Step + 0.5) * o.Step
-        v = tonumber(string.format("%.4f", math.clamp(v, o.Min, o.Max)))
-        o.Table[o.Key] = v
-        paint()
-        if o.Callback then pcall(o.Callback, v) end
-    end
-    local dragging = false
-    hit.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            setFrom(i.Position.X)
-        end
-    end)
-    MainMaid:Add(UserInputService.InputChanged:Connect(function(i)
-        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-            setFrom(i.Position.X)
+    -- Animated Header Gradient Shift
+    TrackConnection(RunService.RenderStepped:Connect(function(dt)
+        if Config.Theme.AnimatedHeader and grad and grad.Parent then
+            grad.Offset = Vector2.new(math.sin(os.clock() * 2.0) * 0.35, 0)
         end
     end))
-    MainMaid:Add(UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
-    end))
-    function obj.Refresh() paint() end
-    accentHook(function(c) fill.BackgroundColor3 = c end)
-    paint()
-    return obj
+
+    -- Tab Bar
+    local tabBar = Instance.new("Frame")
+    tabBar.Size = UDim2.new(1, 0, 0, 34)
+    tabBar.Position = UDim2.new(0, 0, 0, 43)
+    tabBar.BackgroundColor3 = Color3.fromRGB(12, 14, 22)
+    tabBar.BorderSizePixel = 0
+    tabBar.Parent = main
+
+    local tabList = Instance.new("UIListLayout")
+    tabList.FillDirection = Enum.FillDirection.Horizontal
+    tabList.SortOrder = Enum.SortOrder.LayoutOrder
+    tabList.Parent = tabBar
+
+    local contentHolder = Instance.new("Frame")
+    contentHolder.Size = UDim2.new(1, -20, 1, -88)
+    contentHolder.Position = UDim2.new(0, 10, 0, 82)
+    contentHolder.BackgroundTransparency = 1
+    contentHolder.Parent = main
+    UI.ContentHolder = contentHolder
+    UI.TabBar = tabBar
 end
 
-function Tab:Keybind(o)
-    local r = row(self, 34)
-    label({ Text = o.Name, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -110, 1, 0), Parent = r })
-    local btn = new("TextButton", { Text = "", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = P.Text, AutoButtonColor = false,
-        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(92, 24),
-        BackgroundColor3 = P.Bg, Parent = r }, { corner(5), uiStroke(P.Stroke, 1) })
-    local obj = {}
-    local function paint() btn.Text = tostring(o.Table[o.Key]) end
-    function obj.Refresh() paint() end
+local function CreateTab(tabName, order)
+    local btn = Instance.new("TextButton")
+    btn.LayoutOrder = order
+    btn.Size = UDim2.new(1 / 3, 0, 1, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(18, 20, 30)
+    btn.BackgroundTransparency = (order == 1) and 0 or 1
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.TextColor3 = (order == 1) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 155, 175)
+    btn.Text = tabName
+    btn.Parent = UI.TabBar
+
+    local indicator = Instance.new("Frame")
+    indicator.Size = UDim2.new(1, 0, 0, 2)
+    indicator.Position = UDim2.new(0, 0, 1, -2)
+    indicator.BorderSizePixel = 0
+    indicator.Visible = (order == 1)
+    indicator.Parent = btn
+    RegisterAccent(indicator, "BackgroundColor3")
+
+    local page = Instance.new("ScrollingFrame")
+    page.Name = tabName .. "_Page"
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 4
+    page.Visible = (order == 1)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.Parent = UI.ContentHolder
+    RegisterAccent(page, "ScrollBarImageColor3")
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 6)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = page
+
+    UI.TabPages[tabName] = page
+    UI.TabButtons[tabName] = { Button = btn, Indicator = indicator }
+
     btn.MouseButton1Click:Connect(function()
-        if UI.CaptureFn then return end
-        btn.Text = "press key..."
-        UI.CaptureFn = function(kc)
-            if kc == Enum.KeyCode.Escape then paint() return end
-            if kc == Enum.KeyCode.Backspace and o.AllowNone then o.Table[o.Key] = "None"
-            else o.Table[o.Key] = kc.Name end
-            paint()
-            UI.Toast(o.Name .. " -> " .. o.Table[o.Key], "info")
-            if o.Callback then pcall(o.Callback, o.Table[o.Key]) end
+        for name, data in pairs(UI.TabButtons) do
+            local active = (name == tabName)
+            data.Button.BackgroundTransparency = active and 0 or 1
+            data.Button.TextColor3 = active and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 155, 175)
+            data.Indicator.Visible = active
+            UI.TabPages[name].Visible = active
         end
     end)
-    paint()
-    return obj
+
+    return page
 end
 
-function Tab:Dropdown(o) -- click cycles through the options
-    local r = row(self, 34)
-    label({ Text = o.Name, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -130, 1, 0), Parent = r })
-    local btn = new("TextButton", { Text = "", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = P.Text, AutoButtonColor = false,
-        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(112, 24),
-        BackgroundColor3 = P.Bg, Parent = r }, { corner(5), uiStroke(P.Stroke, 1) })
-    local obj = {}
-    local function options() return type(o.Options) == "function" and o.Options() or o.Options end
-    local function paint() btn.Text = tostring(o.Table[o.Key]) .. "  ›" end
-    function obj.Refresh() paint() end
-    btn.MouseButton1Click:Connect(function()
-        local list = options()
-        local i = table.find(list, o.Table[o.Key]) or 0
-        o.Table[o.Key] = list[(i % #list) + 1]
-        paint()
-        if o.Callback then pcall(o.Callback, o.Table[o.Key]) end
+-- UI Control Builders (Toggle, Slider, Button, Cycle Selector)
+local function AddToggle(parent, labelText, initialValue, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -6, 0, 34)
+    row.BackgroundColor3 = Color3.fromRGB(21, 24, 36)
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    CreateCorner(row, 6)
+    CreateStroke(row, Color3.fromRGB(36, 40, 56), 1, 0)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -64, 1, 0)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextColor3 = Color3.fromRGB(230, 232, 242)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = labelText
+    lbl.Parent = row
+
+    local box = Instance.new("TextButton")
+    box.Size = UDim2.new(0, 38, 0, 20)
+    box.Position = UDim2.new(1, -48, 0.5, -10)
+    box.BackgroundColor3 = initialValue and GetAccentColor3() or Color3.fromRGB(40, 44, 62)
+    box.Text = ""
+    box.Parent = row
+    CreateCorner(box, 10)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.Position = initialValue and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.Parent = box
+    CreateCorner(knob, 7)
+
+    local state = initialValue
+    local function SetState(newVal, silent)
+        state = newVal
+        box.BackgroundColor3 = state and GetAccentColor3() or Color3.fromRGB(40, 44, 62)
+        knob.Position = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+        if not silent then
+            callback(state)
+            NotifyToast(labelText .. ": " .. (state and "ON" or "OFF"))
+        end
+    end
+
+    box.MouseButton1Click:Connect(function()
+        SetState(not state, false)
     end)
-    paint()
-    return obj
+
+    return { Set = SetState, Get = function() return state end }
 end
 
-function Tab:Button(o)
-    local r = row(self, 34)
-    r.BackgroundTransparency = 1
-    local btn = new("TextButton", { Text = o.Name, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = P.Text, AutoButtonColor = false,
-        Size = UDim2.fromScale(1, 1), BackgroundColor3 = P.Elem, Parent = r }, { corner(6), uiStroke(o.Danger and Color3.fromRGB(150, 50, 60) or P.Stroke, 1) })
-    btn.MouseEnter:Connect(function() tween(btn, TweenInfo.new(0.12), { BackgroundColor3 = P.Hover }) end)
-    btn.MouseLeave:Connect(function() tween(btn, TweenInfo.new(0.12), { BackgroundColor3 = P.Elem }) end)
-    btn.MouseButton1Click:Connect(function() if o.Callback then pcall(o.Callback) end end)
-    if o.Danger then btn.TextColor3 = Color3.fromRGB(255, 120, 130) end
+local function AddSlider(parent, labelText, minVal, maxVal, defaultVal, decimals, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -6, 0, 46)
+    row.BackgroundColor3 = Color3.fromRGB(21, 24, 36)
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    CreateCorner(row, 6)
+    CreateStroke(row, Color3.fromRGB(36, 40, 56), 1, 0)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0.7, 0, 0, 20)
+    lbl.Position = UDim2.new(0, 10, 0, 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextColor3 = Color3.fromRGB(220, 224, 235)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = labelText
+    lbl.Parent = row
+
+    local valLbl = Instance.new("TextLabel")
+    valLbl.Size = UDim2.new(0.3, -10, 0, 20)
+    valLbl.Position = UDim2.new(0.7, 0, 0, 4)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Font = Enum.Font.Code
+    valLbl.TextSize = 12
+    valLbl.TextColor3 = Color3.fromRGB(240, 240, 250)
+    valLbl.TextXAlignment = Enum.TextXAlignment.Right
+    valLbl.Text = string.format("%." .. decimals .. "f", defaultVal)
+    valLbl.Parent = row
+
+    local track = Instance.new("TextButton")
+    track.Size = UDim2.new(1, -20, 0, 8)
+    track.Position = UDim2.new(0, 10, 0, 30)
+    track.BackgroundColor3 = Color3.fromRGB(35, 38, 54)
+    track.Text = ""
+    track.AutoButtonColor = false
+    track.Parent = row
+    CreateCorner(track, 4)
+
+    local fill = Instance.new("Frame")
+    local initAlpha = math.clamp((defaultVal - minVal) / (maxVal - minVal), 0, 1)
+    fill.Size = UDim2.new(initAlpha, 0, 1, 0)
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    CreateCorner(fill, 4)
+    RegisterAccent(fill, "BackgroundColor3")
+
+    local sliding = false
+    local function UpdateFromInput(input)
+        local relX = math.clamp((input.Position.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+        local raw = minVal + (maxVal - minVal) * relX
+        local mult = 10 ^ decimals
+        local rounded = math.floor(raw * mult + 0.5) / mult
+        fill.Size = UDim2.new(relX, 0, 1, 0)
+        valLbl.Text = string.format("%." .. decimals .. "f", rounded)
+        callback(rounded)
+    end
+
+    track.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = true
+            UpdateFromInput(input)
+        end
+    end)
+    TrackConnection(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = false
+        end
+    end))
+    TrackConnection(UserInputService.InputChanged:Connect(function(input)
+        if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            UpdateFromInput(input)
+        end
+    end))
+end
+
+local function AddButton(parent, text, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -6, 0, 32)
+    btn.BackgroundColor3 = Color3.fromRGB(27, 31, 46)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.TextColor3 = Color3.fromRGB(240, 240, 250)
+    btn.Text = text
+    btn.Parent = parent
+    CreateCorner(btn, 6)
+    CreateStroke(btn, Color3.fromRGB(48, 53, 74), 1, 0)
+
+    btn.MouseButton1Click:Connect(function()
+        callback(btn)
+    end)
     return btn
 end
 
-function Tab:TextBox(o)
-    local r = row(self, 34)
-    label({ Text = o.Name, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -120, 1, 0), Parent = r })
-    local box = new("TextBox", { Text = o.Default or "", PlaceholderText = o.Placeholder or "", Font = Enum.Font.GothamBold, TextSize = 12,
-        TextColor3 = P.Text, PlaceholderColor3 = P.Sub, ClearTextOnFocus = false, AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(100, 24), BackgroundColor3 = P.Bg, Parent = r }, { corner(5), uiStroke(P.Stroke, 1) })
-    box.FocusLost:Connect(function() if o.Callback then pcall(o.Callback, box.Text, box) end end)
-    return { Box = box, SetText = function(_, s) box.Text = s end }
+local function AddCycleSelector(parent, labelText, options, currentVal, callback)
+    local idx = table.find(options, currentVal) or 1
+    local btn
+    btn = AddButton(parent, labelText .. ":  " .. tostring(options[idx]), function()
+        idx = (idx % #options) + 1
+        local chosen = options[idx]
+        btn.Text = labelText .. ":  " .. tostring(chosen)
+        callback(chosen)
+        NotifyToast(labelText .. " -> " .. tostring(chosen))
+    end)
+    return btn
 end
 
---==============================================================================
--- 6. TABS
---==============================================================================
-local function buildTabs()
-    ---------------------------------------------------------------- COMBAT
-    local T = UI.AddTab("Combat")
-
-    T:Section("Auto Block")
-    UI.Elements.AutoBlock = T:Toggle({ Name = "Auto Block", Table = Cfg.Block, Key = "Enabled",
-        Callback = function(v) Combat.onFeatureToggle("Auto Block", v) end })
-    UI.Elements.BlockBind = T:Keybind({ Name = "Toggle Bind", Table = Cfg.Block, Key = "Bind", AllowNone = true })
-    UI.Elements.BlockLead = T:Slider({ Name = "Lead Time", Table = Cfg.Block, Key = "Lead", Min = 0, Max = 0.4, Step = 0.01, Suffix = " s" })
-    UI.Elements.BlockHold = T:Slider({ Name = "Hold After Hit", Table = Cfg.Block, Key = "Hold", Min = 0.1, Max = 1.0, Step = 0.05, Suffix = " s" })
-    UI.Elements.BlockBridge = T:Slider({ Name = "Combo Bridge (hold between hits)", Table = Cfg.Block, Key = "ComboBridge", Min = 0, Max = 0.8, Step = 0.05, Suffix = " s" })
-    UI.Elements.Recovery = T:Toggle({ Name = "Post-Hit Recovery Mode", Table = Cfg.Block, Key = "Recovery",
-        Callback = function(v) UI.Toast("Recovery: " .. (v and "ON" or "OFF"), v and "on" or "off") end })
-    UI.Elements.RecWin = T:Slider({ Name = "Recovery Window", Table = Cfg.Block, Key = "RecoveryWindow", Min = 0.2, Max = 1.5, Step = 0.05, Suffix = " s" })
-
-    T:Section("Auto Parry / Dodge")
-    UI.Elements.AutoDodge = T:Toggle({ Name = "Auto Dodge", Table = Cfg.Dodge, Key = "Enabled",
-        Callback = function(v) Combat.onFeatureToggle("Auto Dodge", v) end })
-    UI.Elements.DodgeBind = T:Keybind({ Name = "Toggle Bind", Table = Cfg.Dodge, Key = "Bind", AllowNone = true })
-    UI.Elements.DodgeLead = T:Slider({ Name = "Dodge Lead", Table = Cfg.Dodge, Key = "Lead", Min = 0, Max = 0.3, Step = 0.01, Suffix = " s" })
-    UI.Elements.DodgeCd = T:Slider({ Name = "Cooldown", Table = Cfg.Dodge, Key = "Cooldown", Min = 0.2, Max = 4, Step = 0.05, Suffix = " s" })
-    UI.Elements.DodgeTap = T:Slider({ Name = "Tap Duration", Table = Cfg.Dodge, Key = "Tap", Min = 0.02, Max = 0.3, Step = 0.01, Suffix = " s" })
-    UI.Elements.DodgeFb = T:Toggle({ Name = "Fallback to Auto Block", Table = Cfg.Dodge, Key = "Fallback" })
-
-    T:Section("Detection")
-    UI.Elements.MaxDist = T:Slider({ Name = "Max Distance", Table = Cfg.Detect, Key = "MaxDistance", Min = 5, Max = 40, Step = 1, Suffix = " studs" })
-    UI.Elements.Facing = T:Toggle({ Name = "Facing Check", Table = Cfg.Detect, Key = "FacingCheck" })
-    UI.Elements.FacingTh = T:Slider({ Name = "Facing Threshold", Table = Cfg.Detect, Key = "FacingThreshold", Min = -0.2, Max = 0.9, Step = 0.05 })
-    UI.Elements.PingComp = T:Toggle({ Name = "Ping Compensation", Table = Cfg.Detect, Key = "PingComp" })
-    UI.Elements.Filter = T:Dropdown({ Name = "Animation Filter", Table = Cfg.Detect, Key = "Filter", Options = { "All", "Learned" } })
-
-    T:Section("Tools")
-    T:Button({ Name = "Test Block", Callback = Combat.testBlock })
-    T:Button({ Name = "Test Dodge", Callback = Combat.testDodge })
-    UI.Elements.Learn = T:Toggle({ Name = "Learn Mode (log to F9 console)", Table = State, Key = "Learn",
-        Callback = function(v)
-            Combat.LearnTracks = {}
-            UI.Toast("Learn mode: " .. (v and "ON" or "OFF"), v and "on" or "off")
-            if v then log("Learn mode ON - take hits; animation id / length / speed / priority / distance / hit moment are logged.") end
-        end })
-    local learnedLbl = T:Label("Learned attacks: 0")
-    function UI.UpdateLearned()
-        local n = 0
-        for _ in pairs(Cfg.Learned) do n += 1 end
-        learnedLbl:SetText("Learned attacks: " .. n)
+-- Toggle Window Open / Close with smooth Tween
+local function SetMenuOpen(openState)
+    State.MenuOpen = openState
+    if not UI.MainFrame then return end
+    if openState then
+        UI.MainFrame.Visible = true
+        if TweenService then
+            TweenService:Create(UI.MainFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundTransparency = Config.Theme.WindowTransparency
+            }):Play()
+        end
+    else
+        UI.MainFrame.Visible = false
     end
-    UI.Elements.LearnedLbl = { Refresh = UI.UpdateLearned }
-    T:Button({ Name = "Reset Learned Timings", Callback = function()
-        Cfg.Learned = {}
-        UI.UpdateLearned()
-        UI.Toast("Learned timings cleared", "info")
-    end })
-
-    ---------------------------------------------------------------- SETTINGS
-    local S = UI.AddTab("Settings")
-    S:Section("Input")
-    UI.Elements.InMode = S:Dropdown({ Name = "Input Mode", Table = Cfg.Input, Key = "Mode", Options = { "Auto", "Key", "Remote" },
-        Callback = function() Input.releaseAll() end })
-    UI.Elements.InMethod = S:Dropdown({ Name = "Key Method", Table = Cfg.Input, Key = "Method", Options = Input.methods,
-        Callback = function() Input.releaseAll() end })
-    UI.Elements.MaxHold = S:Slider({ Name = "Max Hold (anti-stuck)", Table = Cfg.Input, Key = "MaxHold", Min = 1, Max = 10, Step = 0.5, Suffix = " s" })
-
-    S:Section("Keys")
-    UI.Elements.BlockKey = S:Keybind({ Name = "Block Key (in-game)", Table = Cfg.Input, Key = "BlockKey",
-        Callback = function() Input.releaseAll() end })
-    UI.Elements.DodgeKey = S:Keybind({ Name = "Dodge Key (in-game)", Table = Cfg.Input, Key = "DodgeKey",
-        Callback = function() Input.releaseAll() end })
-    UI.Elements.MenuKey = S:Keybind({ Name = "Menu Hotkey", Table = Cfg.Input, Key = "MenuKey" })
-
-    S:Section("Config")
-    local cfgLbl = S:Label(ConfigIO.available() and ("File: " .. ConfigIO.path()) or "File API unavailable in this executor")
-    S:Button({ Name = "Save Config", Callback = ConfigIO.save })
-    S:Button({ Name = "Load Config", Callback = ConfigIO.load })
-
-    S:Section("Script")
-    S:Button({ Name = "UNLOAD SCRIPT", Danger = true, Callback = function() env.RevengersX.Unload() end })
-
-    ---------------------------------------------------------------- THEME
-    local H = UI.AddTab("Theme")
-    H:Section("Accent")
-    local presets = {
-        { "Crimson", "E5334F" }, { "Violet", "8B5CF6" }, { "Cyan", "22D3EE" },
-        { "Emerald", "34D399" }, { "Amber", "F59E0B" }, { "Pink", "EC4899" },
-    }
-    local pr = row(H, 44)
-    local holder = new("Frame", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = pr }, {
-        new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 10),
-            VerticalAlignment = Enum.VerticalAlignment.Center }),
-        new("UIPadding", { PaddingLeft = UDim.new(0, 12) }),
-    })
-    for _, p in ipairs(presets) do
-        local c = fromHex(p[2])
-        local b = new("TextButton", { Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(28, 28), BackgroundColor3 = c, Parent = holder },
-            { corner(14), uiStroke(P.Stroke, 1) })
-        b.MouseEnter:Connect(function() tween(b, TweenInfo.new(0.12), { Size = UDim2.fromOffset(32, 32) }) end)
-        b.MouseLeave:Connect(function() tween(b, TweenInfo.new(0.12), { Size = UDim2.fromOffset(28, 28) }) end)
-        b.MouseButton1Click:Connect(function() UI.SetAccent(c); UI.Toast("Accent: " .. p[1], "info") end)
-    end
-
-    local hex = H:TextBox({ Name = "Custom HEX", Placeholder = "#RRGGBB", Default = "#" .. Cfg.Theme.Accent, Callback = function(txt, box)
-        local c = fromHex(txt)
-        if c then UI.SetAccent(c) else UI.Toast("Invalid HEX", "err"); box.Text = "#" .. Cfg.Theme.Accent end
-    end })
-    local rgb = { R = 0, G = 0, B = 0 }
-    local function fromSliders() UI.SetAccent(Color3.fromRGB(rgb.R, rgb.G, rgb.B), true); hex:SetText("#" .. Cfg.Theme.Accent) end
-    local sR = H:Slider({ Name = "Red", Table = rgb, Key = "R", Min = 0, Max = 255, Step = 1, Callback = fromSliders })
-    local sG = H:Slider({ Name = "Green", Table = rgb, Key = "G", Min = 0, Max = 255, Step = 1, Callback = fromSliders })
-    local sB = H:Slider({ Name = "Blue", Table = rgb, Key = "B", Min = 0, Max = 255, Step = 1, Callback = fromSliders })
-    function UI.SyncTheme()
-        local c = UI.Accent
-        rgb.R, rgb.G, rgb.B = math.round(c.R * 255), math.round(c.G * 255), math.round(c.B * 255)
-        sR.Refresh(); sG.Refresh(); sB.Refresh()
-        hex:SetText("#" .. Cfg.Theme.Accent)
-    end
-
-    H:Section("Window")
-    UI.Elements.AnimTitle = H:Toggle({ Name = "Animated Title Gradient", Table = Cfg.Theme, Key = "AnimateTitle" })
-    UI.Elements.Transp = H:Slider({ Name = "Window Transparency", Table = Cfg.Theme, Key = "Transparency", Min = 0, Max = 0.6, Step = 0.01,
-        Callback = function(v) if State.MenuOpen then UI.Main.GroupTransparency = v end end })
-
-    UI.UpdateLearned()
 end
 
---==============================================================================
--- 7. LIFECYCLE
---==============================================================================
-local function Unload()
+-- ============================================================================
+-- [SEC 5] TABS CONSTRUCTION (COMBAT, SETTINGS, THEME) & SAFE UNLOAD
+-- ============================================================================
+CreateMainUI()
+
+local CombatPage = CreateTab("COMBAT", 1)
+local SettingsPage = CreateTab("SETTINGS", 2)
+local ThemePage = CreateTab("THEME", 3)
+
+-- [1] Populate COMBAT Tab
+local AutoBlockToggle = AddToggle(CombatPage, "Auto Block (Smart 5-Hit Combo Hold)", Config.Combat.AutoBlock, function(v)
+    Config.Combat.AutoBlock = v
+    if not v then StopBlock() end
+end)
+
+AddToggle(CombatPage, "Combo / Post-Hit Recovery Mode", Config.Combat.PostHitRecovery, function(v)
+    Config.Combat.PostHitRecovery = v
+end)
+
+local AutoDodgeToggle = AddToggle(CombatPage, "Auto Parry / Dodge (Q)", Config.Combat.AutoDodge, function(v)
+    Config.Combat.AutoDodge = v
+end)
+
+AddToggle(CombatPage, "Fallback на Auto Block, если Dodge на КД", Config.Combat.DodgeFallbackToBlock, function(v)
+    Config.Combat.DodgeFallbackToBlock = v
+end)
+
+AddSlider(CombatPage, "Block Pre-Hit Lead (sec)", 0.04, 0.35, Config.Combat.BlockLeadTime, 2, function(v)
+    Config.Combat.BlockLeadTime = v
+end)
+
+AddSlider(CombatPage, "5-Hit Combo Hold Extension (sec)", 0.15, 0.80, Config.Combat.ComboHoldExtension, 2, function(v)
+    Config.Combat.ComboHoldExtension = v
+end)
+
+AddSlider(CombatPage, "Dodge Lead Time (sec)", 0.04, 0.30, Config.Combat.DodgeLeadTime, 2, function(v)
+    Config.Combat.DodgeLeadTime = v
+end)
+
+AddSlider(CombatPage, "Dodge Cooldown (sec)", 0.50, 5.00, Config.Combat.DodgeCooldown, 2, function(v)
+    Config.Combat.DodgeCooldown = v
+end)
+
+AddSlider(CombatPage, "Dodge Tap Duration (sec)", 0.02, 0.15, Config.Combat.DodgeTapDuration, 2, function(v)
+    Config.Combat.DodgeTapDuration = v
+end)
+
+AddSlider(CombatPage, "Max Threat Distance (Studs)", 6.0, 35.0, Config.Combat.MaxDistance, 1, function(v)
+    Config.Combat.MaxDistance = v
+end)
+
+AddToggle(CombatPage, "FacingCheck (проверка взгляда атакующего)", Config.Combat.FacingCheck, function(v)
+    Config.Combat.FacingCheck = v
+end)
+
+AddSlider(CombatPage, "Facing Dot Threshold", -0.20, 0.90, Config.Combat.FacingDotThreshold, 2, function(v)
+    Config.Combat.FacingDotThreshold = v
+end)
+
+AddSlider(CombatPage, "Ping Compensation Multiplier", 0.50, 1.60, Config.Combat.PingMultiplier, 2, function(v)
+    Config.Combat.PingMultiplier = v
+end)
+
+AddCycleSelector(CombatPage, "Animation Filter", { "AllCombat", "WhitelistOnly" }, Config.Combat.FilterMode, function(mode)
+    Config.Combat.FilterMode = mode
+end)
+
+AddToggle(CombatPage, "Ignore Teammates & Knocked Targets", Config.Combat.IgnoreTeamAndDead, function(v)
+    Config.Combat.IgnoreTeamAndDead = v
+end)
+
+AddToggle(CombatPage, "Learn Mode (Лог анимаций и таймингов в F9)", Config.Combat.LearnMode, function(v)
+    Config.Combat.LearnMode = v
+end)
+
+AddButton(CombatPage, "Тест Блока (Удержание 0.45s)", function()
+    StartOrExtendBlock(0.45, "ManualTest")
+    NotifyToast("Test Block triggered (0.45s)")
+end)
+
+AddButton(CombatPage, "Тест Доджа / Парирования", function()
+    local res = TryExecuteDodgeOrFallback(0.35)
+    NotifyToast("Test Dodge result: " .. tostring(res))
+end)
+
+AddButton(CombatPage, "Сбросить изученные тайминги (Reset Learned)", function()
+    table.clear(Config.LearnedTimings)
+    NotifyToast("Learned timings cleared")
+end)
+
+-- [2] Populate SETTINGS Tab
+AddCycleSelector(SettingsPage, "Input Mode", { "Auto", "Key", "Remote" }, Config.Settings.InputMode, function(v)
+    Config.Settings.InputMode = v
+end)
+
+AddCycleSelector(SettingsPage, "Key Send Method", { "VIM", "keypress", "Both" }, Config.Settings.KeyMethod, function(v)
+    Config.Settings.KeyMethod = v
+end)
+
+local BlockBindBtn
+BlockBindBtn = AddButton(SettingsPage, "Бинд Клавиши Блока: [" .. Config.Settings.BlockKey .. "] (Клик для смены)", function()
+    State.BindingTarget = "BlockKey"
+    BlockBindBtn.Text = "Нажмите любую клавишу..."
+end)
+
+local DodgeBindBtn
+DodgeBindBtn = AddButton(SettingsPage, "Бинд Клавиши Доджа: [" .. Config.Settings.DodgeKey .. "] (Клик для смены)", function()
+    State.BindingTarget = "DodgeKey"
+    DodgeBindBtn.Text = "Нажмите любую клавишу..."
+end)
+
+local MenuBindBtn
+MenuBindBtn = AddButton(SettingsPage, "Горячая клавиша Меню: [" .. Config.Settings.MenuKey .. "] (Клик для смены)", function()
+    State.BindingTarget = "MenuKey"
+    MenuBindBtn.Text = "Нажмите любую клавишу..."
+end)
+
+AddButton(SettingsPage, "Сохранить Конфиг в JSON", function()
+    local ok, err = SaveConfigToDisk()
+    NotifyToast(ok and "Конфиг сохранён (JSON)" or ("Ошибка сохранения: " .. tostring(err)))
+end)
+
+AddButton(SettingsPage, "Загрузить Конфиг из JSON", function()
+    local ok, err = LoadConfigFromDisk()
+    if ok then
+        ApplyThemeUpdates()
+        NotifyToast("Конфиг успешно загружен")
+    else
+        NotifyToast("Ошибка загрузки: " .. tostring(err))
+    end
+end)
+
+-- Full Safe Unload Procedure
+local function UnloadScript()
     if State.Unloaded then return end
     State.Unloaded = true
-    Block.holdUntil = 0
-    pcall(Input.releaseAll)                       -- release held keys first
-    for plr in pairs(Combat.Hooks) do Combat.unhookPlayer(plr) end
-    MainMaid:Destroy()                            -- connections, loops, GUI
-    Combat.clear()
-    if env.RevengersX and env.RevengersX.Unload == Unload then env.RevengersX = nil end
-    log("Unloaded.")
+
+    ForceReleaseAllKeys()
+
+    for _, conn in ipairs(State.Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(State.Connections)
+    table.clear(State.TrackedTracks)
+
+    if UI.ScreenGui then
+        pcall(function() UI.ScreenGui:Destroy() end)
+        UI.ScreenGui = nil
+    end
+
+    if getgenv then
+        getgenv().__RevengersX_Unload = nil
+    end
 end
-env.RevengersX = { Unload = Unload, Cfg = Cfg }
 
-local function init()
-    Input.normalize()
-    local saved = fromHex(Cfg.Theme.Accent)
-    if saved then UI.Accent = saved end
+if getgenv then
+    getgenv().__RevengersX_Unload = UnloadScript
+end
 
-    UI.Build()
-    buildTabs()
-    UI.SetAccent(UI.Accent)
+AddButton(SettingsPage, "Полная выгрузка скрипта (UNLOAD)", function()
+    UnloadScript()
+end)
 
-    -- Players
-    for _, p in ipairs(Players:GetPlayers()) do Combat.hookPlayer(p) end
-    MainMaid:Add(Players.PlayerAdded:Connect(Combat.hookPlayer))
-    MainMaid:Add(Players.PlayerRemoving:Connect(function(p)
-        if p == LP then Input.releaseAll() end
-        Combat.unhookPlayer(p)
-    end))
+-- [3] Populate THEME Tab
+local Presets = {
+    { Name = "Royal Violet", R = 124, G = 58,  B = 237 },
+    { Name = "Crimson Rose", R = 225, G = 29,  B = 72  },
+    { Name = "Cyber Cyan",   R = 6,   G = 182, B = 212 },
+    { Name = "Neon Emerald", R = 16,  G = 185, B = 129 },
+    { Name = "Solar Amber",  R = 245, G = 158, B = 11  },
+}
 
-    -- Local character
-    if LP.Character then hookLocalCharacter(LP.Character) end
-    MainMaid:Add(LP.CharacterAdded:Connect(hookLocalCharacter))
-    MainMaid:Add(LP.CharacterRemoving:Connect(function()
-        Block.holdUntil = 0
-        Input.releaseAll()
-    end))
-
-    -- Focus lost -> never leave a key stuck
-    MainMaid:Add(UserInputService.WindowFocusReleased:Connect(function()
-        Block.holdUntil = 0
-        Input.releaseAll()
-    end))
-
-    -- Hotkeys: key capture > menu > feature binds
-    MainMaid:Add(UserInputService.InputBegan:Connect(function(input, processed)
-        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-        if UI.CaptureFn then
-            local f = UI.CaptureFn
-            UI.CaptureFn = nil
-            f(input.KeyCode)
-            return
-        end
-        if processed then return end
-        local name = input.KeyCode.Name
-        if name == Cfg.Input.MenuKey then UI.ToggleMenu() return end
-        if name == Cfg.Input.BlockKey or name == Cfg.Input.DodgeKey then return end -- avoid bind/in-game key conflicts
-        if name == Cfg.Block.Bind then UI.Elements.AutoBlock:Set(not Cfg.Block.Enabled)
-        elseif name == Cfg.Dodge.Bind then UI.Elements.AutoDodge:Set(not Cfg.Dodge.Enabled) end
-    end))
-
-    -- Main combat loop
-    local warned = false
-    MainMaid:Add(RunService.Heartbeat:Connect(function()
-        if State.Unloaded then return end
-        local ok, err = pcall(Combat.step, os.clock())
-        if not ok and not warned then warned = true; log("combat step error: %s", tostring(err)) end
-    end))
-
-    task.delay(0.1, function() UI.SetVisible(true) end)
-    task.delay(0.6, function()
-        UI.Toast("Revengers X loaded - " .. Cfg.Input.MenuKey .. " toggles menu", "info")
-        if not Input.keyAvailable() then UI.Toast("No key backend - using Remote mode", "err") end
+for _, preset in ipairs(Presets) do
+    AddButton(ThemePage, "Пресет акцента: " .. preset.Name, function()
+        Config.Theme.AccentR = preset.R
+        Config.Theme.AccentG = preset.G
+        Config.Theme.AccentB = preset.B
+        ApplyThemeUpdates()
+        NotifyToast("Тема: " .. preset.Name)
     end)
-    log("Loaded. Menu key: %s | key methods: %s", Cfg.Input.MenuKey, table.concat(Input.methods(), "/"))
 end
 
-local ok, err = pcall(init)
-if not ok then
-    warn("[RevengersX] init failed: " .. tostring(err))
-    Unload()
-end
+AddSlider(ThemePage, "Кастомный Акцент — Red (R)", 0, 255, Config.Theme.AccentR, 0, function(v)
+    Config.Theme.AccentR = v
+    ApplyThemeUpdates()
+end)
+
+AddSlider(ThemePage, "Кастомный Акцент — Green (G)", 0, 255, Config.Theme.AccentG, 0, function(v)
+    Config.Theme.AccentG = v
+    ApplyThemeUpdates()
+end)
+
+AddSlider(ThemePage, "Кастомный Акцент — Blue (B)", 0, 255, Config.Theme.AccentB, 0, function(v)
+    Config.Theme.AccentB = v
+    ApplyThemeUpdates()
+end)
+
+AddToggle(ThemePage, "Анимация градиента заголовка", Config.Theme.AnimatedHeader, function(v)
+    Config.Theme.AnimatedHeader = v
+end)
+
+AddSlider(ThemePage, "Прозрачность окна (Transparency)", 0.00, 0.45, Config.Theme.WindowTransparency, 2, function(v)
+    Config.Theme.WindowTransparency = v
+    ApplyThemeUpdates()
+end)
+
+-- ============================================================================
+-- GLOBAL KEYBIND LISTENER & HEARTBEAT CONNECTION
+-- ============================================================================
+TrackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if State.Unloaded then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    local pressedName = input.KeyCode.Name
+
+    -- Handle interactive keybind assignment
+    if State.BindingTarget then
+        local target = State.BindingTarget
+        State.BindingTarget = nil
+        Config.Settings[target] = pressedName
+
+        if target == "BlockKey" then
+            BlockBindBtn.Text = "Бинд Клавиши Блока: [" .. pressedName .. "] (Клик для смены)"
+        elseif target == "DodgeKey" then
+            DodgeBindBtn.Text = "Бинд Клавиши Доджа: [" .. pressedName .. "] (Клик для смены)"
+        elseif target == "MenuKey" then
+            MenuBindBtn.Text = "Горячая клавиша Меню: [" .. pressedName .. "] (Клик для смены)"
+            if UI.MenuBindLabel then
+                UI.MenuBindLabel.Text = "[" .. pressedName .. "]"
+            end
+        end
+        NotifyToast("Новый бинд " .. target .. ": " .. pressedName)
+        return
+    end
+
+    if gameProcessed then return end
+
+    -- Menu Toggle Hotkey (Default: RightShift)
+    if pressedName == Config.Settings.MenuKey then
+        SetMenuOpen(not State.MenuOpen)
+    end
+end))
+
+TrackConnection(RunService.Heartbeat:Connect(StepCombatCore))
+
+NotifyToast("Revengers X Loaded (" .. Config.Settings.MenuKey .. " — меню)", 2.8)
