@@ -952,7 +952,7 @@ function UI.AddTab(name)
     })
     accentHook(function(c) page.ScrollBarImageColor3 = c end)
 
-    local tab = setmetatable({ Page = page, Button = btn, Order = 0, Index = idx }, Tab)
+    local tab = setmetatable({ Page = page, HeaderBtn = btn, Order = 0, Index = idx }, Tab)
     UI.Tabs[idx] = tab
     btn.MouseButton1Click:Connect(function() UI.SelectTab(idx) end)
     if idx == 1 then UI.SelectTab(1, true) end
@@ -962,7 +962,7 @@ end
 function UI.SelectTab(idx, instant)
     for i, t in ipairs(UI.Tabs) do
         t.Page.Visible = (i == idx)
-        tween(t.Button, TweenInfo.new(0.15), { TextColor3 = i == idx and P.Text or P.Sub })
+        tween(t.HeaderBtn, TweenInfo.new(0.15), { TextColor3 = i == idx and P.Text or P.Sub })
     end
     tween(UI.Indicator, TweenInfo.new(instant and 0 or 0.25, Enum.EasingStyle.Quint), { Position = UDim2.new((idx - 1) / TAB_COUNT, 0, 1, 0) })
 end
