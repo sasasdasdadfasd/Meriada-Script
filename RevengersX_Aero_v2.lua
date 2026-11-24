@@ -57,6 +57,7 @@ local Config = {
 	Predict = true,       -- range check looks ahead to the hit moment (an attacker lunging in is a threat before he arrives)
 	TapTime = 0.05,       -- seconds a parry tap is held, uncalibrated
 	MaxHold = 3,
+	DamageHold = 1.0,     -- seconds the block is held when damage is taken (0.1 - 2)
 	IgnoreTeammates = true,
 
 	-- How the block/parry is produced. Mode and Key are set from Settings > Block input.
@@ -770,7 +771,7 @@ local function hookLocalCharacter(char)
 				print(("[Meriada:learn] damage taken: %s"):format(blockDown and "re-pressing block" or "holding block"))
 			end
 			rearmBlock()
-			requestBlock(os.clock() + Config.HoldTime)
+			requestBlock(os.clock() + Config.DamageHold)
 		end))
 	end)
 end
@@ -2226,6 +2227,10 @@ addSelector(combat, {
 addSlider(combat, {
 	Id = "anyDelay", Name = "Reaction delay (any mode)", Min = 0, Max = 0.5, Step = 0.01, Default = Config.AnyDelay, Decimals = 2, Suffix = " s",
 	Callback = function(v) Config.AnyDelay = v end,
+})
+addSlider(combat, {
+	Id = "damageHold", Name = "Block hold when hit", Min = 0.1, Max = 2, Step = 0.05, Default = Config.DamageHold, Decimals = 2, Suffix = " s",
+	Callback = function(v) Config.DamageHold = v end,
 })
 addSlider(combat, {
 	Id = "holdTime", Name = "Block hold after the hit", Min = 0.1, Max = 1.5, Step = 0.05, Default = Config.HoldTime, Decimals = 2, Suffix = " s",
