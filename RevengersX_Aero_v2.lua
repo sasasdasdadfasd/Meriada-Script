@@ -53,6 +53,8 @@ local Config = {
 	FacingDot = 0.3,      -- uncalibrated
 	CompensatePing = true,
 	PingMul = 1.0,        -- multiplier on the measured ping (GetNetworkPing is a round trip; raise it if blocks still land late)
+	TotalGuard = true,    -- hold the block the whole time any attack animation of a nearby enemy plays (no timing needed)
+	GuardRange = 14,      -- studs for Total guard
 	Repress = true,       -- release+press the block just before each swing of a combo (the game may drop a held block after a hit)
 	Predict = true,       -- range check looks ahead to the hit moment (an attacker lunging in is a threat before he arrives)
 	TapTime = 0.05,       -- seconds a parry tap is held, uncalibrated
@@ -273,6 +275,7 @@ end
 -- BLOCK CONTROLLER: one held key; every request only extends the deadline, so a combo stays blocked
 ---------------------------------------------------------------------
 local blockDown = false
+local blockPressedAt = 0
 local blockUntil = 0
 local rearmRequested = false
 local lastRearm = 0
@@ -285,12 +288,14 @@ local function blockController()
 		warnOnce("startfail", "block press failed: " .. tostring(err))
 		return
 	end
+	blockPressedAt = os.clock()
 	while Alive and os.clock() < blockUntil do
 		if rearmRequested then
 			rearmRequested = false
 			pcall(pressBlock, false)
 			task.wait(0.04)
 			pcall(pressBlock, true)
+			blockPressedAt = os.clock()
 		end
 		task.wait()
 	end
@@ -768,7 +773,7 @@ local function hookLocalCharacter(char)
 				return
 			end
 			if Config.Learn then
-				print(("[Meriada:learn] damage taken: %s"):format(blockDown and "re-pressing block" or "holding block"))
+				print(("[Meriada:learn] HIT TAKEN: block key was %s (pressed %.2fs ago) -> %s"):format(blockDown and "DOWN" or "UP", os.clock() - blockPressedAt, blockDown and "re-pressing block" or "holding block"))
 			end
 			rearmBlock()
 			requestBlock(os.clock() + Config.DamageHold)
@@ -797,7 +802,18 @@ connect(RunService.Heartbeat, function()
 	end
 	-- drop finished tracks and catch a swing that was replayed on the same track (position jumps back)
 	local now = os.clock()
+	local guardRoot = nil
+	if State.AutoBlock and Config.TotalGuard and blockConfigured() and isAlive(LocalPlayer.Character) then
+		guardRoot = getRoot(LocalPlayer.Character)
+	end
 	for track, a in active do
+		if guardRoot and track.IsPlaying and a.char.Parent and isAlive(a.char) then
+			local gr = getRoot(a.char)
+			if gr and (gr.Position - guardRoot.Position).Magnitude <= Config.GuardRange then
+				markEngaged(a.char)
+				requestBlock(now + 0.15)
+			end
+		end
 		if not track.IsPlaying then
 			if now - a.start > 0.2 then
 				active[track] = nil
@@ -2203,6 +2219,14 @@ addToggle(combat, {
 addToggle(combat, {
 	Id = "autoLearn", Name = "Learn hit timing from damage", Default = Config.AutoLearn,
 	Callback = function(v) Config.AutoLearn = v end,
+})
+addToggle(combat, {
+	Id = "totalGuard", Name = "Total guard (hold block while a nearby enemy attacks)", Default = Config.TotalGuard,
+	Callback = function(v) Config.TotalGuard = v end,
+})
+addSlider(combat, {
+	Id = "guardRange", Name = "Total guard range", Min = 3, Max = 30, Step = 1, Default = Config.GuardRange, Decimals = 0, Suffix = " st",
+	Callback = function(v) Config.GuardRange = v end,
 })
 addToggle(combat, {
 	Id = "predict", Name = "Predict approach (block a lunging attacker early)", Default = Config.Predict,
