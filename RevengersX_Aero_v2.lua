@@ -52,6 +52,8 @@ local Config = {
 	FacingCheck = true,
 	FacingDot = 0.3,      -- uncalibrated
 	CompensatePing = true,
+	PingMul = 1.0,        -- multiplier on the measured ping (GetNetworkPing is a round trip; raise it if blocks still land late)
+	Predict = true,       -- range check looks ahead to the hit moment (an attacker lunging in is a threat before he arrives)
 	TapTime = 0.05,       -- seconds a parry tap is held, uncalibrated
 	MaxHold = 3,
 	IgnoreTeammates = true,
@@ -139,7 +141,7 @@ local function isAlive(char)
 end
 
 -- returns true, or false plus a short reason (printed in Learn mode)
-local function isThreat(attackerChar, maxDist)
+local function isThreat(attackerChar, maxDist, lookahead)
 	local myChar = LocalPlayer.Character
 	local myRoot, theirRoot = getRoot(myChar), getRoot(attackerChar)
 	if not (myRoot and theirRoot and isAlive(myChar)) then
@@ -151,8 +153,13 @@ local function isThreat(attackerChar, maxDist)
 	end
 	local offset = myRoot.Position - theirRoot.Position
 	local dist = offset.Magnitude
-	if dist ~= dist or dist > maxDist then
-		return false, ("too far: %.1f studs > max %.1f"):format(dist, maxDist)
+	local reach = dist -- distance now, or the predicted distance at the hit moment if that is smaller
+	if Config.Predict and lookahead and lookahead > 0 and dist == dist then
+		local drift = (theirRoot.AssemblyLinearVelocity - myRoot.AssemblyLinearVelocity) * math.min(lookahead, 0.6)
+		reach = math.min(dist, (offset - drift).Magnitude)
+	end
+	if reach ~= reach or reach > maxDist then
+		return false, ("too far: %.1f studs (predicted %.1f) > max %.1f"):format(dist, reach, maxDist)
 	end
 	if Config.FacingCheck and not engagedNow and dist > 0.001 then
 		local dot = theirRoot.CFrame.LookVector:Dot(offset / dist)
@@ -255,7 +262,7 @@ local function getPing()
 		return LocalPlayer:GetNetworkPing()
 	end)
 	if ok and type(p) == "number" and p == p and p >= 0 and p < 2 then
-		return p
+		return p * Config.PingMul
 	end
 	return 0
 end
@@ -418,14 +425,16 @@ local function calibrate(now)
 	if not myRoot then
 		return
 	end
-	local best = nil
+	local best, bestScore = nil, math.huge
 	for _, a in active do
 		local dt = now - a.start
 		if not a.consumed and dt >= 0.04 and dt <= 1.5 and a.char.Parent then
 			local root = getRoot(a.char)
 			if root and (root.Position - myRoot.Position).Magnitude <= Config.ReactiveRange then
-				if best == nil or a.start < best.start then
-					best = a
+				local expected = hitFor(a.id, Config.Attacks[a.id] or {})
+				local score = expected and math.abs(dt - expected) or (0.25 + dt * 0.5)
+				if best == nil or score < bestScore then
+					best, bestScore = a, score
 				end
 			end
 		end
@@ -471,6 +480,64 @@ local function blockEnd(startAbs, hit, track)
 		return e
 	end
 	return math.max(os.clock() + Config.HoldTime, animEnd)
+end
+
+-- Pending swings. Every Heartbeat each swing is re-evaluated until it fires or expires, so a swing that was out of
+-- range at its press time (the attacker is still dashing in) is blocked the moment he gets close, before the hit.
+local swings = {}
+
+local function stepSwing(s, now, ping)
+	local char, entry = s.char, s.entry
+	if not Alive or s.done or not char.Parent then
+		return true
+	end
+	if entry.RequirePlaying ~= false and not s.track.IsPlaying then
+		s.why("animation stopped before the press time")
+		return true
+	end
+	local hit = hitFor(s.id, entry)
+	local parry = s.kind == "parry"
+	local lead = parry and Config.DodgeLead or Config.BlockLead
+	local pressAbs = s.startAbs + (hit and (hit - lead - ping) or (parry and Config.DodgeDelay or Config.AnyDelay))
+	if now < pressAbs then
+		return false
+	end
+	local expireAt = hit and (s.startAbs + hit + 0.08) or (pressAbs + 0.6)
+	local lookahead = hit and (s.startAbs + hit - now) or 0.15
+	local threat, reason = isThreat(char, entry.Range or Config.MaxDistance, lookahead)
+	if not threat then
+		s.reason = reason
+		if now > expireAt then
+			s.why(reason .. " (watched until the hit moment)")
+			return true
+		end
+		return false
+	end
+	markEngaged(char)
+	local action = s.kind
+	if action == "parry" and not (State.AutoParry and dodgeReady()) then
+		if entry.Kind == nil and State.AutoBlock and blockConfigured() then
+			action = "block"
+		else
+			s.why("dodge is on cooldown or Auto Parry is OFF")
+			return true
+		end
+	end
+	if action == "block" and not State.AutoBlock then
+		s.why("Auto Block was turned OFF")
+		return true
+	end
+	if Config.Learn then
+		print(("[Meriada:learn] %s id=%s attacker=%s press at +%.3fs (%.3fs before hit), hit=%s"):format(
+			action == "block" and "BLOCK" or "DODGE", s.id, s.player.Name, now - s.startAbs, lookahead,
+			hit and ("%.3f"):format(hit) or "unknown"))
+	end
+	if action == "parry" then
+		doDodge()
+	else
+		requestBlock(blockEnd(s.startAbs, hit, s.track))
+	end
+	return true
 end
 
 local function handleTrack(player, char, track, elapsed)
@@ -562,51 +629,7 @@ local function handleTrack(player, char, track, elapsed)
 		return
 	end
 
-	local hit = hitFor(id, entry)
-	local ping = getPing()
-	local blockPress = hit and (hit - Config.BlockLead - ping) or Config.AnyDelay
-	local dodgePress = hit and (hit - Config.DodgeLead - ping) or Config.DodgeDelay
-	local pressT = (kind == "parry") and dodgePress or blockPress
-
-	local function fire()
-		if not Alive or not char.Parent then
-			return
-		end
-		if entry.RequirePlaying ~= false and not track.IsPlaying then
-			why("animation already stopped before the press time")
-			return
-		end
-		local threat, reason = isThreat(char, entry.Range or Config.MaxDistance)
-		if not threat then
-			why(reason)
-			return
-		end
-		markEngaged(char)
-		local action = kind
-		if action == "parry" and not (State.AutoParry and dodgeReady()) then
-			if entry.Kind == nil and State.AutoBlock and blockConfigured() then
-				action = "block"
-			else
-				why("dodge is on cooldown or Auto Parry is OFF")
-				return
-			end
-		end
-		if action == "block" and not State.AutoBlock then
-			why("Auto Block was turned OFF")
-			return
-		end
-		if Config.Learn then
-			print(("[Meriada:learn] %s id=%s attacker=%s press at +%.3fs, hit=%s"):format(
-				action == "block" and "BLOCK" or "DODGE", id, player.Name, pressT, hit and ("%.3f"):format(hit) or "unknown"))
-		end
-		if action == "parry" then
-			doDodge()
-		else
-			requestBlock(blockEnd(startAbs, hit, track))
-		end
-	end
-
-	task.delay(math.max(0, startAbs + pressT - os.clock()), fire)
+	table.insert(swings, { id = id, entry = entry, kind = kind, track = track, char = char, player = player, startAbs = startAbs, why = why })
 end
 
 local function clearChar(player)
@@ -781,6 +804,15 @@ connect(RunService.Heartbeat, function()
 				handleTrack(a.player, a.char, track, pos)
 			else
 				a.lastPos = pos
+			end
+		end
+	end
+	if #swings > 0 then
+		local ping = getPing()
+		for i = #swings, 1, -1 do
+			local okStep, finished = pcall(stepSwing, swings[i], now, ping)
+			if not okStep or finished then
+				table.remove(swings, i)
 			end
 		end
 	end
@@ -2166,6 +2198,14 @@ addToggle(combat, {
 addToggle(combat, {
 	Id = "autoLearn", Name = "Learn hit timing from damage", Default = Config.AutoLearn,
 	Callback = function(v) Config.AutoLearn = v end,
+})
+addToggle(combat, {
+	Id = "predict", Name = "Predict approach (block a lunging attacker early)", Default = Config.Predict,
+	Callback = function(v) Config.Predict = v end,
+})
+addSlider(combat, {
+	Id = "pingMul", Name = "Ping compensation x", Min = 0, Max = 3, Step = 0.1, Default = Config.PingMul, Decimals = 1, Suffix = "x",
+	Callback = function(v) Config.PingMul = v end,
 })
 addSlider(combat, {
 	Id = "blockLead", Name = "Block lead before the hit", Min = 0, Max = 0.3, Step = 0.01, Default = Config.BlockLead, Decimals = 2, Suffix = " s",
