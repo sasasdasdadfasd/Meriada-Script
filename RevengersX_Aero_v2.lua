@@ -44,7 +44,7 @@ local Config = {
 	ComboGuard = true,    -- keep the block held while an engaged attacker is in range (covers the gaps between combo hits)
 	LongAnim = 1.0,       -- animations at least this long (a whole combo in one track) are held to their end, uncalibrated
 	AutoLearn = true,     -- learn each animation's hit moment from the damage I take
-	BlockLead = 0.05,     -- block is pressed this many seconds before the hit moment, uncalibrated
+	BlockLead = 0.1,      -- block is pressed this many seconds before the hit moment, uncalibrated
 	Dodge = { Key = Enum.KeyCode.Q }, -- in-game dodge key
 	DodgeCooldown = 1.0,  -- minimum seconds between dodges, uncalibrated
 	DodgeLead = 0.12,     -- dodge is pressed this many seconds before the hit moment, uncalibrated
@@ -53,6 +53,7 @@ local Config = {
 	FacingDot = 0.3,      -- uncalibrated
 	CompensatePing = true,
 	PingMul = 1.0,        -- multiplier on the measured ping (GetNetworkPing is a round trip; raise it if blocks still land late)
+	Repress = true,       -- release+press the block just before each swing of a combo (the game may drop a held block after a hit)
 	Predict = true,       -- range check looks ahead to the hit moment (an attacker lunging in is a threat before he arrives)
 	TapTime = 0.05,       -- seconds a parry tap is held, uncalibrated
 	MaxHold = 3,
@@ -457,7 +458,7 @@ local function calibrate(now)
 	e.n += 1
 	local sorted = table.clone(e.samples)
 	table.sort(sorted)
-	e.hit = sorted[math.floor((#sorted + 1) / 2)]
+	e.hit = sorted[math.max(1, math.floor((#sorted + 1) / 3))] -- lower third: pressing early costs nothing, late costs a hit
 	if Config.Learn then
 		print(("[Meriada:learn] calibrated id=%s: damage %.3fs after start (stored hit %.3f, n=%d)"):format(
 			best.id, sample, e.hit, e.n))
@@ -535,6 +536,9 @@ local function stepSwing(s, now, ping)
 	if action == "parry" then
 		doDodge()
 	else
+		if Config.Repress and blockDown then
+			rearmBlock()
+		end
 		requestBlock(blockEnd(s.startAbs, hit, s.track))
 	end
 	return true
@@ -2202,6 +2206,10 @@ addToggle(combat, {
 addToggle(combat, {
 	Id = "predict", Name = "Predict approach (block a lunging attacker early)", Default = Config.Predict,
 	Callback = function(v) Config.Predict = v end,
+})
+addToggle(combat, {
+	Id = "repress", Name = "Re-press block before each combo hit", Default = Config.Repress,
+	Callback = function(v) Config.Repress = v end,
 })
 addSlider(combat, {
 	Id = "pingMul", Name = "Ping compensation x", Min = 0, Max = 3, Step = 0.1, Default = Config.PingMul, Decimals = 1, Suffix = "x",
