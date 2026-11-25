@@ -1,5 +1,5 @@
 --[=[
-    Revengers X | Aero Combat Toolkit V11 - damage-correlated nearby animation recorder
+    Revengers X | Aero Combat Toolkit V12 - seeded attack animation candidates
     Client-side Luau utility for Roblox executors.
 
     IMPORTANT LIMITATIONS
@@ -7,15 +7,16 @@
     - Impact timing prefers common named keyframes when present, then falls back to an animation-ratio estimate.
     - Learn Mode can correlate local health loss with a recently validated nearby opponent track; it does not dump all opponents' animation IDs.
     - Remote input is supported only through an explicit RemoteAdapter configured below.
-    - V11 records local-character animations separately and quietly observes nearby remote players/NPCs.
-    - Remote animation IDs are printed only when correlated with local health loss; this is correlation, not proof of a hitbox.
+    - V12 seeds three user-observed nearby NPC Action animation IDs as attack candidates.
+    - Candidate playback can request Auto Block; local health-loss correlations update per-ID statistics.
+    - Candidate IDs are not proof of a hitbox; keep validating them against repeated damage events.
     - Immediate response mode rechecks an AnimationPlayed track after a short grace period, then guards only nearby candidates facing or moving toward the local character.
     - An animation track alone does not expose its victim/hitbox; facing and movement are directional heuristics. If the game does not replicate the track to this client, client-side detection cannot see it.
 
     Recommended: use key input first. Configure exact animation timings only after observing the
     game's animations in Learn mode. This file has not been run inside Roblox or an executor here.
 
-    V11 integration notes (adapted patterns; no foreign game IDs/remotes copied):
+    V12 integration notes (adapted patterns; no foreign game IDs/remotes copied):
     - Animation marker observation: https://github.com/Zyn-ic/AnimateService
     - Config UI foundation: https://github.com/Footagesus/WindUI
     - Cooldown utility pattern: https://github.com/merani2/Roblox-Luau-Utilities
@@ -34,7 +35,7 @@ end)
 --==============================================================
 
 local CONFIG = {
-    Version = 11,
+    Version = 12,
     MenuKey = "RightShift",
     BlockKey = "F",
     DodgeKey = "Q",
@@ -101,6 +102,7 @@ local CONFIG = {
 }
 
 local UIRefs -- forward-declared: Combat Core updates the live sensor when the GUI exists.
+local printDamageCandidateStats -- forward-declared for GUI diagnostics callbacks.
 
 local State = {
     Unloaded = false,
@@ -893,7 +895,7 @@ local function bindLocalCharacter(character)
         animationId = tostring(animationId or "unknown")
         if animationId == "" then animationId = "unknown" end
         print(string.format(
-            "[Aero V11 SELF] PLAY | name=%s | id=%s | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | source=%s",
+            "[Aero V12 SELF] PLAY | name=%s | id=%s | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | source=%s",
             tostring(animationName), animationId, tonumber(length) or 0, tonumber(speed) or 1,
             tonumber(position) or 0, tostring(priority), tostring(looped), tostring(source or "AnimationPlayed")
         ))
@@ -921,7 +923,7 @@ local function bindLocalCharacter(character)
     end
     connect(character.DescendantAdded, inspectLocalDescendant, State.LocalCharacterConnections)
     if CONFIG.RecordSelfAnimations then
-        print("[Aero V11 SELF] Recorder ready. Perform your combo; your character's Animation IDs will appear below.")
+        print("[Aero V12 SELF] Recorder ready. Perform your combo; your character's Animation IDs will appear below.")
     end
 
     local thread = task.spawn(function()
@@ -2100,6 +2102,10 @@ local function makeUI()
         ))
         toast("Diagnostics printed to console")
     end)
+    addAction(combat, "Print attack animation stats", function()
+        if printDamageCandidateStats then printDamageCandidateStats() end
+        toast("Attack animation stats printed to console")
+    end)
 
     -- Settings: preserve only Aero's current settings and lifecycle actions.
     pageSection(settings, "Input backend")
@@ -2556,6 +2562,10 @@ local function makeWindUI()
             tonumber(d.LastVelocityDot) or -1, tostring(d.LastReject), tostring(d.LastBlockReason)))
         aeroNotify("Diagnostics", "Printed to F9 console", "terminal")
     end })
+    combat:Button({ Title = "Print attack animation stats", Icon = "chart-no-axes-column", Callback = function()
+        if printDamageCandidateStats then printDamageCandidateStats() end
+        aeroNotify("Attack animation stats", "Printed to F9 console", "terminal")
+    end })
 
     combat:Section({ Title = "Animation markers / debug console" })
     combat:Paragraph({ Title = "Marker observer", Desc = "Listens for common marker names (Hit, Impact, Damage, Strike, Hitbox, Attack). Marker events are diagnostic only; they are not verified hitboxes." })
@@ -2682,7 +2692,7 @@ connect(Players.PlayerRemoving, function(player)
 end)
 
 --==============================================================
--- V11 nearby remote animation observer / local-damage correlation
+-- V12 nearby remote animation observer / seeded attack candidate correlation
 -- Watches PLAYER characters and NPCs silently. Logs only tracks near the
 -- moment local health decreases. Animation visibility still depends on replication.
 --==============================================================
@@ -2690,8 +2700,51 @@ local DamageObservedAnimators = setmetatable({}, { __mode = "k" })
 local DamageObservedModels = setmetatable({}, { __mode = "k" })
 local DamageRecentTracks = {}
 local DamageLearnedIds = {}
+local DamageCandidateStats = {}
+local DamageCandidateLastBlock = setmetatable({}, { __mode = "k" })
 local DAMAGE_RECENT_SECONDS = 1.25
 local DAMAGE_MAX_RECORDS = 500
+
+-- These three IDs were observed on the nearby TemplateR6 NPC immediately
+-- before the local character lost health in the user's V11 test. They are
+-- candidate attack animations, not confirmed hitbox/impact markers.
+local SEEDED_DAMAGE_CANDIDATE_IDS = {
+    "rbxassetid://82186027802842",
+    "rbxassetid://113708829314153",
+    "rbxassetid://92110044324959",
+}
+
+local function normalizeDamageAnimationId(value)
+    local raw = tostring(value or "")
+    local numeric = string.match(raw, "[?&]id=(%d+)")
+        or string.match(raw, "rbxassetid://(%d+)")
+        or string.match(raw, "(%d+)$")
+    if numeric then return "rbxassetid://" .. numeric end
+    return raw
+end
+
+local function getDamageCandidateStats(id)
+    local normalized = normalizeDamageAnimationId(id)
+    local stats = DamageCandidateStats[normalized]
+    if not stats then
+        stats = {
+            Seeded = false,
+            Plays = 0,
+            DamageMatches = 0,
+            LastPlayAt = 0,
+            LastDamageAt = 0,
+            LastTarget = "unknown",
+        }
+        DamageCandidateStats[normalized] = stats
+    end
+    return normalized, stats
+end
+
+for _, candidateId in ipairs(SEEDED_DAMAGE_CANDIDATE_IDS) do
+    local normalized, stats = getDamageCandidateStats(candidateId)
+    stats.Seeded = true
+    DamageLearnedIds[normalized] = true
+end
 
 local function damageRoot(model)
     if not model then return nil end
@@ -2751,16 +2804,36 @@ local function reportDamageTrack(record, reason, reported)
     if record.Id == "unknown" then return false end
     local modelPath = record.OwnerName
     pcall(function() modelPath = record.Model:GetFullName() end)
-    local reportKey = tostring(modelPath) .. "|" .. record.Id
+    local normalizedId, stats = getDamageCandidateStats(record.Id)
+    local reportKey = tostring(modelPath) .. "|" .. normalizedId
     if reported and reported[reportKey] then return false end
     if reported then reported[reportKey] = true end
+
+    local actionPriority = string.find(tostring(record.Priority), "Action", 1, true) ~= nil
+    local nonLooped = tostring(record.Looped) == "false"
+    local eligibleCandidate = actionPriority and nonLooped
+    local candidateKind = stats.Seeded and "SEEDED" or (DamageLearnedIds[normalizedId] and "LEARNED" or "OBSERVED")
+
+    -- Only short, non-looped Action-priority tracks can be newly learned from
+    -- a damage correlation. Core locomotion/idle tracks are never promoted.
+    if eligibleCandidate and not DamageLearnedIds[normalizedId] then
+        DamageLearnedIds[normalizedId] = true
+        candidateKind = "NEW_DAMAGE_LEARNED"
+    end
+
+    if eligibleCandidate then
+        stats.DamageMatches += 1
+        stats.LastDamageAt = os.clock()
+        stats.LastTarget = tostring(record.OwnerName)
+    end
+
     print(string.format(
-        "[Aero V11 DAMAGE] %s | type=%s | target=%s | id=%s | animName=%s | distance=%.2f | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s",
-        tostring(reason), tostring(record.Kind), tostring(record.OwnerName), tostring(record.Id),
+        "[Aero V12 DAMAGE] %s | type=%s | target=%s | id=%s | animName=%s | distance=%.2f | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | candidate=%s | matches=%d | plays=%d",
+        tostring(reason), tostring(record.Kind), tostring(record.OwnerName), tostring(normalizedId),
         tostring(record.Name), distance, record.Length, record.Speed, record.Position,
-        tostring(record.Priority), tostring(record.Looped)
+        tostring(record.Priority), tostring(record.Looped),
+        eligibleCandidate and candidateKind or "NO", stats.DamageMatches, stats.Plays
     ))
-    DamageLearnedIds[record.Id] = true
     return true
 end
 
@@ -2785,13 +2858,43 @@ local function observeDamageAnimator(model, animator)
             table.remove(DamageRecentTracks, 1)
         end
 
-        -- An ID is only learned after it coincides with local damage. On a later
-        -- playback nearby, this can begin guarding before the next hit lands.
-        if DamageLearnedIds[record.Id] and damageDistance(model) <= CONFIG.NpcScanRadius and CONFIG.AutoBlock then
+        local normalizedId, stats = getDamageCandidateStats(record.Id)
+        local actionPriority = string.find(tostring(record.Priority), "Action", 1, true) ~= nil
+        local nonLooped = tostring(record.Looped) == "false"
+        local isCandidate = DamageLearnedIds[normalizedId] and actionPriority and nonLooped
+        local distance = damageDistance(model)
+        if isCandidate and distance <= CONFIG.NpcScanRadius then
             local now = os.clock()
-            requestBlock(now + math.max(CONFIG.BlockHoldAfterImpact, 0.16), now,
-                "previously damage-correlated animation " .. record.Id)
-            setActionHeld("Block", CONFIG.BlockKey, true)
+            stats.Plays += 1
+            stats.LastPlayAt = now
+            print(string.format(
+                "[Aero V12 ATTACK] CANDIDATE_PLAY | type=%s | target=%s | id=%s | distance=%.2f | length=%.3f | position=%.3f | priority=%s | seeded=%s | plays=%d | damageMatches=%d",
+                tostring(record.Kind), tostring(record.OwnerName), normalizedId, distance,
+                record.Length, record.Position, tostring(record.Priority), tostring(stats.Seeded),
+                stats.Plays, stats.DamageMatches
+            ))
+
+            if CONFIG.AutoBlock then
+                local perAnimator = DamageCandidateLastBlock[animator]
+                if not perAnimator then
+                    perAnimator = {}
+                    DamageCandidateLastBlock[animator] = perAnimator
+                end
+                local lastBlockAt = perAnimator[normalizedId] or -math.huge
+                if now - lastBlockAt >= 0.10 then
+                    perAnimator[normalizedId] = now
+                    -- Hold through most of the observed animation plus the configured
+                    -- combo gap. This is a conservative animation-window heuristic.
+                    local animationHold = math.min(math.max(record.Length, 0.20), 0.65)
+                    local hold = math.max(CONFIG.BlockHoldAfterImpact, animationHold) + CONFIG.ComboGap
+                    requestBlock(now + hold, now, "V12 damage-candidate animation " .. normalizedId)
+                    setActionHeld("Block", CONFIG.BlockKey, true)
+                    print(string.format(
+                        "[Aero V12 AUTOBLOCK] requested | id=%s | hold=%.2fs | target=%s",
+                        normalizedId, hold, tostring(record.OwnerName)
+                    ))
+                end
+            end
         end
     end)
 
@@ -2859,6 +2962,22 @@ local function nearbyDamageSnapshot(damageAt, reported, reason)
     end
 end
 
+printDamageCandidateStats = function()
+    print("[Aero V12 STATS] Damage-correlated animation candidates:")
+    local ids = {}
+    for id in pairs(DamageCandidateStats) do table.insert(ids, id) end
+    table.sort(ids)
+    for _, id in ipairs(ids) do
+        local stats = DamageCandidateStats[id]
+        if stats and (stats.Seeded or stats.Plays > 0 or stats.DamageMatches > 0) then
+            print(string.format(
+                "[Aero V12 STATS] id=%s | seeded=%s | plays=%d | damageMatches=%d | lastTarget=%s",
+                id, tostring(stats.Seeded), stats.Plays, stats.DamageMatches, tostring(stats.LastTarget)
+            ))
+        end
+    end
+end
+
 local function bindLocalDamageScanner(character)
     task.spawn(function()
         local humanoid = character:WaitForChild("Humanoid", 8)
@@ -2873,7 +2992,7 @@ local function bindLocalDamageScanner(character)
             local damageAt = os.clock()
             local reported = {}
             print(string.format(
-                "[Aero V11 DAMAGE] local health decreased to %.2f | checking PLAYER + NPC animation tracks within %.1f studs",
+                "[Aero V12 DAMAGE] local health decreased to %.2f | correlating PLAYER + NPC tracks within %.1f studs",
                 health, CONFIG.NpcScanRadius
             ))
             nearbyDamageSnapshot(damageAt, reported, "ACTIVE_AT_DAMAGE")
@@ -2888,7 +3007,7 @@ local function bindLocalDamageScanner(character)
                 if State.Unloaded then return end
                 if not next(reported) then
                     print(string.format(
-                        "[Aero V11 DAMAGE] NO REMOTE TRACK FOUND | radius=%.1f | possible causes: opponent animations are not replicated, target has no Humanoid/AnimationController Animator, or target was outside radius",
+                        "[Aero V12 DAMAGE] NO REMOTE TRACK FOUND | radius=%.1f | possible causes: opponent animations are not replicated, target has no Humanoid/AnimationController Animator, or target was outside radius",
                         CONFIG.NpcScanRadius
                     ))
                 end
@@ -3013,4 +3132,4 @@ if false and (UIRefs.Gradient or UIRefs.Shimmer) then
     addThread(thread)
 end
 
-print("[Aero] Revengers X toolkit V8 initialized. Default response: target-directed Immediate block; Auto Dodge is off by default. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
+print("[Aero] Revengers X toolkit V12 initialized. Default response: target-directed Immediate block; Auto Dodge is off by default. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
