@@ -1,5 +1,5 @@
 --[=[
-    Revengers X | Aero Combat Toolkit V10 - local animation recorder
+    Revengers X | Aero Combat Toolkit V11 - damage-correlated nearby animation recorder
     Client-side Luau utility for Roblox executors.
 
     IMPORTANT LIMITATIONS
@@ -7,15 +7,15 @@
     - Impact timing prefers common named keyframes when present, then falls back to an animation-ratio estimate.
     - Learn Mode can correlate local health loss with a recently validated nearby opponent track; it does not dump all opponents' animation IDs.
     - Remote input is supported only through an explicit RemoteAdapter configured below.
-    - V10 records AnimationPlayed events from the LOCAL character and prints only those IDs in the self-recorder.
-    - Nearby NPC animations are sampled only when the LOCAL player loses health; regular NPC playback is silent.
+    - V11 records local-character animations separately and quietly observes nearby remote players/NPCs.
+    - Remote animation IDs are printed only when correlated with local health loss; this is correlation, not proof of a hitbox.
     - Immediate response mode rechecks an AnimationPlayed track after a short grace period, then guards only nearby candidates facing or moving toward the local character.
     - An animation track alone does not expose its victim/hitbox; facing and movement are directional heuristics. If the game does not replicate the track to this client, client-side detection cannot see it.
 
     Recommended: use key input first. Configure exact animation timings only after observing the
     game's animations in Learn mode. This file has not been run inside Roblox or an executor here.
 
-    V10 integration notes (adapted patterns; no foreign game IDs/remotes copied):
+    V11 integration notes (adapted patterns; no foreign game IDs/remotes copied):
     - Animation marker observation: https://github.com/Zyn-ic/AnimateService
     - Config UI foundation: https://github.com/Footagesus/WindUI
     - Cooldown utility pattern: https://github.com/merani2/Roblox-Luau-Utilities
@@ -34,7 +34,7 @@ end)
 --==============================================================
 
 local CONFIG = {
-    Version = 10,
+    Version = 11,
     MenuKey = "RightShift",
     BlockKey = "F",
     DodgeKey = "Q",
@@ -893,7 +893,7 @@ local function bindLocalCharacter(character)
         animationId = tostring(animationId or "unknown")
         if animationId == "" then animationId = "unknown" end
         print(string.format(
-            "[Aero V10 SELF] PLAY | name=%s | id=%s | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | source=%s",
+            "[Aero V11 SELF] PLAY | name=%s | id=%s | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | source=%s",
             tostring(animationName), animationId, tonumber(length) or 0, tonumber(speed) or 1,
             tonumber(position) or 0, tostring(priority), tostring(looped), tostring(source or "AnimationPlayed")
         ))
@@ -921,7 +921,7 @@ local function bindLocalCharacter(character)
     end
     connect(character.DescendantAdded, inspectLocalDescendant, State.LocalCharacterConnections)
     if CONFIG.RecordSelfAnimations then
-        print("[Aero V10 SELF] Recorder ready. Perform your combo; your character's Animation IDs will appear below.")
+        print("[Aero V11 SELF] Recorder ready. Perform your combo; your character's Animation IDs will appear below.")
     end
 
     local thread = task.spawn(function()
@@ -2682,95 +2682,183 @@ connect(Players.PlayerRemoving, function(player)
 end)
 
 --==============================================================
--- V9 NPC animation observer / damage-correlated learning
--- Scans Workspace NPC models (not only Players). Damage correlation is heuristic.
+-- V11 nearby remote animation observer / local-damage correlation
+-- Watches PLAYER characters and NPCs silently. Logs only tracks near the
+-- moment local health decreases. Animation visibility still depends on replication.
 --==============================================================
-local NpcObservedAnimators = setmetatable({}, { __mode = "k" })
-local NpcObservedModels = setmetatable({}, { __mode = "k" })
-local NpcLearnedIds = {}
-local NpcLastDamageScan = 0
+local DamageObservedAnimators = setmetatable({}, { __mode = "k" })
+local DamageObservedModels = setmetatable({}, { __mode = "k" })
+local DamageRecentTracks = {}
+local DamageLearnedIds = {}
+local DAMAGE_RECENT_SECONDS = 1.25
+local DAMAGE_MAX_RECORDS = 500
 
-local function npcRoot(model)
+local function damageRoot(model)
     if not model then return nil end
     return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
         or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
 end
 
-local function npcDistance(model)
+local function damageDistance(model)
     local _, _, localRoot = getCharacterParts(LocalPlayer)
-    local root = npcRoot(model)
+    local root = damageRoot(model)
     if not localRoot or not root then return math.huge end
-    local ok, value = pcall(function() return (localRoot.Position-root.Position).Magnitude end)
+    local ok, value = pcall(function() return (localRoot.Position - root.Position).Magnitude end)
     return ok and value or math.huge
 end
 
-local function logNpcTrack(model, track, reason)
-    local animationId, length, position, speed, weight = "unknown", 0, 0, 1, 0
+local function damageModelKind(model)
+    local player
+    pcall(function() player = Players:GetPlayerFromCharacter(model) end)
+    if player then return "PLAYER", player.Name end
+    return "NPC", model.Name
+end
+
+local function readDamageTrack(model, track)
+    local id, name = "unknown", "unknown"
+    local length, position, speed, weight = 0, 0, 1, 0
+    local priority, looped = "Unknown", false
     pcall(function()
         local animation = track.Animation
-        animationId = animation and animation.AnimationId or "unknown"
+        if animation then
+            id = animation.AnimationId or "unknown"
+            name = animation.Name or "unknown"
+        end
         length = track.Length
         position = track.TimePosition
         speed = track.Speed
         weight = track.WeightCurrent
+        priority = track.Priority
+        looped = track.Looped
     end)
-    local distance = npcDistance(model)
-    State.Diagnostics.NpcTracksSeen += 1
-    print(string.format("[Aero V10 DAMAGE] %s | npc=%s | id=%s | distance=%.2f | position=%.3f | length=%.3f | speed=%.2f | weight=%.2f",
-        tostring(reason), model:GetFullName(), tostring(animationId), distance,
-        tonumber(position) or 0, tonumber(length) or 0, tonumber(speed) or 1, tonumber(weight) or 0))
-    return tostring(animationId), distance
+    id = tostring(id or "unknown")
+    if id == "" then id = "unknown" end
+    local kind, ownerName = damageModelKind(model)
+    return {
+        At = os.clock(), Model = model, Id = id, Name = tostring(name),
+        Length = tonumber(length) or 0, Position = tonumber(position) or 0,
+        Speed = tonumber(speed) or 1, Weight = tonumber(weight) or 0,
+        Priority = tostring(priority), Looped = tostring(looped),
+        Kind = kind, OwnerName = tostring(ownerName), Track = track,
+    }
 end
 
-local function observeNpcAnimator(model, animator)
-    if not animator or NpcObservedAnimators[animator] then return end
+local function reportDamageTrack(record, reason, reported)
+    if not record or not record.Model or not record.Model.Parent then return false end
+    if record.Model == LocalPlayer.Character then return false end
+    local distance = damageDistance(record.Model)
+    if distance > CONFIG.NpcScanRadius then return false end
+    if record.Id == "unknown" then return false end
+    local modelPath = record.OwnerName
+    pcall(function() modelPath = record.Model:GetFullName() end)
+    local reportKey = tostring(modelPath) .. "|" .. record.Id
+    if reported and reported[reportKey] then return false end
+    if reported then reported[reportKey] = true end
+    print(string.format(
+        "[Aero V11 DAMAGE] %s | type=%s | target=%s | id=%s | animName=%s | distance=%.2f | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s",
+        tostring(reason), tostring(record.Kind), tostring(record.OwnerName), tostring(record.Id),
+        tostring(record.Name), distance, record.Length, record.Speed, record.Position,
+        tostring(record.Priority), tostring(record.Looped)
+    ))
+    DamageLearnedIds[record.Id] = true
+    return true
+end
+
+local function observeDamageAnimator(model, animator)
+    if not animator or DamageObservedAnimators[animator] then return end
     local ok, isAnimator = pcall(function() return animator:IsA("Animator") end)
     if not ok or not isAnimator then return end
-    NpcObservedAnimators[animator] = model
-    State.Diagnostics.NpcAnimatorsBound += 1
-    -- NPC animator binding is intentionally silent; output is reserved for local damage snapshots.
+    DamageObservedAnimators[animator] = model
 
-    local function onPlayed(track)
-        local id = "unknown"
-        pcall(function()
-            local animation = track.Animation
-            id = animation and animation.AnimationId or "unknown"
-        end)
-        id = tostring(id or "unknown")
-        local distance = npcDistance(model)
-        -- Do not print every NPC animation. Only a previously damage-correlated ID
-        -- can trigger a short diagnostic and the optional block response.
-        if NpcLearnedIds[id] and distance <= CONFIG.NpcScanRadius then
-            print(string.format("[Aero V10 NPC] learned candidate replay | npc=%s | id=%s | distance=%.2f",
-                model:GetFullName(), id, distance))
-            if CONFIG.AutoBlock then
-                local now = os.clock()
-                requestBlock(now + math.max(CONFIG.BlockHoldAfterImpact, 0.16), now, "learned NPC animation " .. id)
-                setActionHeld("Block", CONFIG.BlockKey, true)
+    connect(animator.AnimationPlayed, function(track)
+        if State.Unloaded or not track or model == LocalPlayer.Character then return end
+        local record = readDamageTrack(model, track)
+        if record.Id == "unknown" then return end
+        table.insert(DamageRecentTracks, record)
+        local cutoff = os.clock() - DAMAGE_RECENT_SECONDS
+        for i = #DamageRecentTracks, 1, -1 do
+            if DamageRecentTracks[i].At < cutoff then
+                table.remove(DamageRecentTracks, i)
             end
         end
-    end
-    connect(animator.AnimationPlayed, onPlayed)
+        while #DamageRecentTracks > DAMAGE_MAX_RECORDS do
+            table.remove(DamageRecentTracks, 1)
+        end
+
+        -- An ID is only learned after it coincides with local damage. On a later
+        -- playback nearby, this can begin guarding before the next hit lands.
+        if DamageLearnedIds[record.Id] and damageDistance(model) <= CONFIG.NpcScanRadius and CONFIG.AutoBlock then
+            local now = os.clock()
+            requestBlock(now + math.max(CONFIG.BlockHoldAfterImpact, 0.16), now,
+                "previously damage-correlated animation " .. record.Id)
+            setActionHeld("Block", CONFIG.BlockKey, true)
+        end
+    end)
+
     local playing = {}
     pcall(function() playing = animator:GetPlayingAnimationTracks() end)
-    for _, track in ipairs(playing) do onPlayed(track) end
+    for _, track in ipairs(playing) do
+        local record = readDamageTrack(model, track)
+        if record.Id ~= "unknown" then
+            table.insert(DamageRecentTracks, record)
+        end
+    end
 end
 
-local function observeNpcModel(model)
-    if not model or NpcObservedModels[model] then return end
-    if not model:IsA("Model") or Players:GetPlayerFromCharacter(model) then return end
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return end
-    NpcObservedModels[model] = true
+local function observeDamageModel(model)
+    if not model or DamageObservedModels[model] then return end
+    local isModel = false
+    pcall(function() isModel = model:IsA("Model") end)
+    if not isModel or model == LocalPlayer.Character then return end
+
+    local controller
+    -- Use a controller owned directly by this character Model. A recursive search
+    -- could incorrectly bind a nested character's Animator to its outer container.
+    pcall(function()
+        controller = model:FindFirstChildOfClass("Humanoid")
+            or model:FindFirstChildOfClass("AnimationController")
+    end)
+    if not controller then return end
+    DamageObservedModels[model] = true
+
     local function inspect(descendant)
-        if descendant:IsA("Animator") then observeNpcAnimator(model, descendant) end
+        local isAnimator = false
+        pcall(function() isAnimator = descendant:IsA("Animator") end)
+        if isAnimator then observeDamageAnimator(model, descendant) end
     end
-    for _, descendant in ipairs(model:GetDescendants()) do inspect(descendant) end
+    local descendants = {}
+    pcall(function() descendants = model:GetDescendants() end)
+    for _, descendant in ipairs(descendants) do inspect(descendant) end
     connect(model.DescendantAdded, inspect)
 end
 
--- The training NPC's attack usually reduces the LOCAL character health, not the NPC health.
--- Observe the local health signal and snapshot every nearby NPC Animator at that moment.
+local function nearbyDamageSnapshot(damageAt, reported, reason)
+    -- First report animations that started shortly BEFORE the health event.
+    local lowerBound = damageAt - DAMAGE_RECENT_SECONDS
+    for _, record in ipairs(DamageRecentTracks) do
+        if record.At >= lowerBound and record.At <= damageAt + 0.04 then
+            reportDamageTrack(record, "RECENT_BEFORE_DAMAGE", reported)
+        end
+    end
+
+    -- Then inspect still-playing tracks immediately after damage and at short intervals.
+    for model in pairs(DamageObservedModels) do
+        if model and model.Parent and model ~= LocalPlayer.Character
+            and damageDistance(model) <= CONFIG.NpcScanRadius then
+            for animator, owner in pairs(DamageObservedAnimators) do
+                if owner == model and animator.Parent then
+                    local active = {}
+                    pcall(function() active = animator:GetPlayingAnimationTracks() end)
+                    for _, track in ipairs(active) do
+                        local record = readDamageTrack(model, track)
+                        reportDamageTrack(record, reason or "ACTIVE_AT_DAMAGE", reported)
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function bindLocalDamageScanner(character)
     task.spawn(function()
         local humanoid = character:WaitForChild("Humanoid", 8)
@@ -2781,59 +2869,49 @@ local function bindLocalDamageScanner(character)
             local tookDamage = health < previous
             previous = health
             if not tookDamage then return end
-            print(string.format("[Aero V10 DAMAGE] local health decreased to %.2f | sampling NPC animations within %.1f studs (correlation, not proof)", health, CONFIG.NpcScanRadius))
-            local reportedThisHit = {}
-            for _, delayTime in ipairs({0, 0.08, 0.18, 0.32}) do
+
+            local damageAt = os.clock()
+            local reported = {}
+            print(string.format(
+                "[Aero V11 DAMAGE] local health decreased to %.2f | checking PLAYER + NPC animation tracks within %.1f studs",
+                health, CONFIG.NpcScanRadius
+            ))
+            nearbyDamageSnapshot(damageAt, reported, "ACTIVE_AT_DAMAGE")
+
+            for _, delayTime in ipairs({0.07, 0.16, 0.28, 0.42}) do
                 task.delay(delayTime, function()
                     if State.Unloaded then return end
-                    for model in pairs(NpcObservedModels) do
-                        if model and model.Parent and npcDistance(model) <= CONFIG.NpcScanRadius then
-                            for animator, owner in pairs(NpcObservedAnimators) do
-                                if owner == model and animator.Parent then
-                                    local active = {}
-                                    pcall(function() active = animator:GetPlayingAnimationTracks() end)
-                                    for _, track in ipairs(active) do
-                                        local id = "unknown"
-                                        pcall(function()
-                                            local animation = track.Animation
-                                            id = animation and animation.AnimationId or "unknown"
-                                        end)
-                                        id = tostring(id or "unknown")
-                                        local distance = npcDistance(model)
-                                        local reportKey = model:GetFullName() .. "|" .. id
-                                        if distance <= CONFIG.NpcScanRadius and id ~= "unknown" and not reportedThisHit[reportKey] then
-                                            reportedThisHit[reportKey] = true
-                                            logNpcTrack(model, track, "LOCAL_DAMAGE_CORRELATED")
-                                            NpcLearnedIds[id] = true
-                                            print("[Aero V10 DAMAGE] candidate animation (not confirmed hitbox): " .. id)
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
+                    nearbyDamageSnapshot(damageAt, reported, "ACTIVE_AFTER_DAMAGE")
                 end)
             end
+            task.delay(0.48, function()
+                if State.Unloaded then return end
+                if not next(reported) then
+                    print(string.format(
+                        "[Aero V11 DAMAGE] NO REMOTE TRACK FOUND | radius=%.1f | possible causes: opponent animations are not replicated, target has no Humanoid/AnimationController Animator, or target was outside radius",
+                        CONFIG.NpcScanRadius
+                    ))
+                end
+            end)
         end)
     end)
 end
 
--- Initial scan plus future NPC spawns.
+-- Observe all remote character models, including player characters and NPCs.
+-- No animation IDs are printed here; output is gated by local health loss above.
 for _, instance in ipairs(workspace:GetDescendants()) do
-    if instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid") then
-        observeNpcModel(instance)
-    end
+    if instance:IsA("Model") then observeDamageModel(instance) end
 end
 if LocalPlayer.Character then bindLocalDamageScanner(LocalPlayer.Character) end
 connect(LocalPlayer.CharacterAdded, bindLocalDamageScanner)
 
 connect(workspace.DescendantAdded, function(instance)
     if instance:IsA("Model") then
-        task.defer(function() if instance.Parent then observeNpcModel(instance) end end)
-    elseif instance:IsA("Humanoid") or instance:IsA("Animator") then
+        task.defer(function() if instance.Parent then observeDamageModel(instance) end end)
+    elseif instance:IsA("Humanoid") or instance:IsA("AnimationController") or instance:IsA("Animator") then
         task.defer(function()
             local model = instance:FindFirstAncestorOfClass("Model")
-            if model then observeNpcModel(model) end
+            if model then observeDamageModel(model) end
         end)
     end
 end)
