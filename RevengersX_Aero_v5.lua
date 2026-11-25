@@ -1,5 +1,5 @@
 --[=[
-    Revengers X | Aero Combat Toolkit V15 - 3D animation lab
+    Revengers X | Aero Combat Toolkit V16 - full place animation discovery
     Client-side Luau utility for Roblox executors.
 
     IMPORTANT LIMITATIONS
@@ -37,7 +37,7 @@ end)
 --==============================================================
 
 local CONFIG = {
-    Version = 15,
+    Version = 16,
     MenuKey = "RightShift",
     BlockKey = "F",
     DodgeKey = "Q",
@@ -157,6 +157,8 @@ local State = {
     AnimationLabMarks = {},
     AnimationCatalog = {},
     AnimationCatalogScannedAt = 0,
+    AnimationLiveAnimators = setmetatable({}, { __mode = "k" }),
+    AnimationLiveHookInstalled = false,
     KnownTracks = setmetatable({}, { __mode = "k" }),
     LastThreatAt = 0,
     LastThreatPlayer = nil,
@@ -3281,8 +3283,8 @@ end
 -- No other player's character is modified or used as a preview rig.
 --==============================================================
 local AnimationCatalog = {}
-local ANIMATION_SCAN_MAX_VISITED = 80000
-local ANIMATION_PRINT_LIMIT = 400
+local ANIMATION_SCAN_MAX_VISITED = 300000
+local ANIMATION_PRINT_LIMIT = 1200
 
 local function classifyAnimationPath(path)
     local lower = string.lower(tostring(path or ""))
@@ -3313,29 +3315,84 @@ local function getAnimationInstanceInfo(instance)
 end
 
 local function getAnimationRoots()
-    local roots, seen = {}, {}
-    local function push(instance, label)
-        if instance and not seen[instance] then
-            seen[instance] = true
-            table.insert(roots, { Instance = instance, Label = label })
+    -- DataModel:GetDescendants() traverses client-visible descendants across services,
+    -- including mini-game folders that are not under the usual storage/player roots.
+    return { { Instance = game, Label = "DataModel" } }
+end
+
+local function addLiveAnimation(animation, source)
+    if not animation then return false end
+    local ok, isAnimation = pcall(function() return animation:IsA("Animation") end)
+    if not ok or not isAnimation then return false end
+    local id, name, fullName = getAnimationInstanceInfo(animation)
+    if id == "" or id == "unknown" then return false end
+    local entry = AnimationCatalog[id]
+    if not entry then
+        entry = { Id = id, Name = name, Group = classifyAnimationPath(fullName), Occurrences = 0, Paths = {}, Sources = {} }
+        AnimationCatalog[id] = entry
+    end
+    entry.Occurrences = (entry.Occurrences or 0) + 1
+    entry.Sources = entry.Sources or {}
+    entry.Sources[source or "live"] = true
+    local exists = false
+    for _, path in ipairs(entry.Paths or {}) do if path == fullName then exists = true; break end end
+    if not exists and #(entry.Paths or {}) < 8 then table.insert(entry.Paths, fullName) end
+    if entry.Group == "Unclassified" then
+        local group = classifyAnimationPath(fullName)
+        if group ~= "Unclassified" then entry.Group = group end
+    end
+    State.AnimationCatalog = AnimationCatalog
+    return true
+end
+
+local function observeAnimationAnimator(animator)
+    if not animator or State.AnimationLiveAnimators[animator] then return end
+    local ok, isAnimator = pcall(function() return animator:IsA("Animator") end)
+    if not ok or not isAnimator then return end
+    State.AnimationLiveAnimators[animator] = true
+    connect(animator.AnimationPlayed, function(track)
+        local animation
+        pcall(function() animation = track.Animation end)
+        if animation and addLiveAnimation(animation, "AnimationPlayed") then
+            local id = getAnimationInstanceInfo(animation)
+            print(string.format("[Aero V16 LIVE] AnimationPlayed | id=%s | animator=%s", tostring(id), tostring(animator:GetFullName())))
+            if refreshAnimationLabList then pcall(refreshAnimationLabList) end
+        end
+    end)
+end
+
+local function installAnimationLiveHooks()
+    if State.AnimationLiveHookInstalled then return end
+    State.AnimationLiveHookInstalled = true
+    local ok, descendants = pcall(function() return game:GetDescendants() end)
+    if ok then
+        for _, instance in ipairs(descendants) do
+            local isAnimator = false
+            pcall(function() isAnimator = instance:IsA("Animator") end)
+            if isAnimator then observeAnimationAnimator(instance) end
         end
     end
-    push(safeService("ReplicatedStorage"), "ReplicatedStorage")
-    push(safeService("ReplicatedFirst"), "ReplicatedFirst")
-    push(safeService("StarterPlayer"), "StarterPlayer")
-    push(safeService("StarterGui"), "StarterGui")
-    push(safeService("StarterPack"), "StarterPack")
-    push(safeService("Lighting"), "Lighting")
-    push(LocalPlayer:FindFirstChildOfClass("PlayerGui"), "PlayerGui")
-    push(LocalPlayer:FindFirstChildOfClass("Backpack"), "Backpack")
-    push(LocalPlayer.Character, "Character")
-    push(Workspace, "Workspace")
-    return roots
+    connect(game.DescendantAdded, function(instance)
+        local isAnimation, isAnimator = false, false
+        pcall(function() isAnimation = instance:IsA("Animation"); isAnimator = instance:IsA("Animator") end)
+        if isAnimation then
+            if addLiveAnimation(instance, "DescendantAdded") and refreshAnimationLabList then pcall(refreshAnimationLabList) end
+        elseif isAnimator then
+            observeAnimationAnimator(instance)
+        end
+    end)
+    print("[Aero V16 LIVE] Dynamic Animation and Animator discovery enabled across client-visible DataModel")
 end
 
 scanAnimationCatalog = function()
     if State.Unloaded then return 0 end
+    installAnimationLiveHooks()
+    -- Keep prior discoveries so scanning another mini-game adds to the catalog
+    -- instead of replacing animations found in earlier modes.
     local byId, visited, foundObjects = {}, 0, 0
+    for id, oldEntry in pairs(AnimationCatalog) do
+        byId[id] = oldEntry
+    end
     local roots = getAnimationRoots()
     local visitedInstances = setmetatable({}, { __mode = "k" })
 
@@ -3343,6 +3400,9 @@ scanAnimationCatalog = function()
         if visitedInstances[instance] then return end
         visitedInstances[instance] = true
         visited += 1
+        local isAnimator = false
+        pcall(function() isAnimator = instance:IsA("Animator") end)
+        if isAnimator then observeAnimationAnimator(instance); return end
         local isAnimation = false
         pcall(function() isAnimation = instance:IsA("Animation") end)
         if not isAnimation then return end
@@ -3388,16 +3448,16 @@ scanAnimationCatalog = function()
         groupCounts[entry.Group] = (groupCounts[entry.Group] or 0) + 1
     end
 
-    print(string.format("[Aero V15 SCAN] complete | visited=%d | AnimationObjects=%d | uniqueIDs=%d | limit=%d",
-        visited, foundObjects, unique, ANIMATION_SCAN_MAX_VISITED))
+    print(string.format("[Aero V16 SCAN] complete | visited=%d | AnimationObjects=%d | cumulativeUniqueIDs=%d | limit=%d | limitReached=%s",
+        visited, foundObjects, unique, ANIMATION_SCAN_MAX_VISITED, tostring(visited >= ANIMATION_SCAN_MAX_VISITED)))
     local groupNames = {}
     for name in pairs(groupCounts) do table.insert(groupNames, name) end
     table.sort(groupNames)
     for _, name in ipairs(groupNames) do
-        print(string.format("[Aero V15 SCAN] GROUP | %s | uniqueIDs=%d", name, groupCounts[name]))
+        print(string.format("[Aero V16 SCAN] GROUP | %s | uniqueIDs=%d", name, groupCounts[name]))
     end
     if unique == 0 then
-        print("[Aero V15 SCAN] No client-visible Animation instances with IDs were found. Some assets may only be created after equipping a style; switch styles and scan again.")
+        print("[Aero V16 SCAN] No client-visible Animation instances with IDs were found. Some assets may only be created after equipping a style; switch styles and scan again.")
     end
     pcall(function()
         aeroNotify("Animation scan", string.format("Found %d unique Animation IDs", unique), "scan-search")
@@ -3412,18 +3472,18 @@ printAnimationCatalog = function()
         count += 1
     end
     table.sort(names)
-    print(string.format("[Aero V15 SCAN] catalog | uniqueIDs=%d | scannedAt=%.2f", count, tonumber(State.AnimationCatalogScannedAt) or 0))
+    print(string.format("[Aero V16 SCAN] catalog | uniqueIDs=%d | scannedAt=%.2f", count, tonumber(State.AnimationCatalogScannedAt) or 0))
     local printed = 0
     for _, id in ipairs(names) do
         if printed >= ANIMATION_PRINT_LIMIT then
-            print(string.format("[Aero V15 SCAN] output capped at %d IDs; catalog still contains %d", ANIMATION_PRINT_LIMIT, count))
+            print(string.format("[Aero V16 SCAN] output capped at %d IDs; catalog still contains %d", ANIMATION_PRINT_LIMIT, count))
             break
         end
         local entry = AnimationCatalog[id]
-        print(string.format("[Aero V15 SCAN] ID | group=%s | name=%s | id=%s | occurrences=%d",
+        print(string.format("[Aero V16 SCAN] ID | group=%s | name=%s | id=%s | occurrences=%d",
             tostring(entry.Group), tostring(entry.Name), tostring(id), tonumber(entry.Occurrences) or 1))
         for _, path in ipairs(entry.Paths or {}) do
-            print("[Aero V15 SCAN] PATH | " .. tostring(path))
+            print("[Aero V16 SCAN] PATH | " .. tostring(path))
         end
         printed += 1
     end
@@ -3579,7 +3639,7 @@ openAnimationLabPanel = function()
         return
     end
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 8)
-    if not playerGui then warn("[Aero V15 LAB] PlayerGui unavailable"); return end
+    if not playerGui then warn("[Aero V16 LAB] PlayerGui unavailable"); return end
 
     local gui = Instance.new("ScreenGui")
     gui.Name = "AERO_V15_AnimationLab"
@@ -3606,7 +3666,7 @@ openAnimationLabPanel = function()
     local title = Instance.new("TextLabel")
     title.BackgroundTransparency = 1; title.Position = UDim2.fromOffset(12, 0); title.Size = UDim2.new(1, -100, 1, 0)
     title.Font = Enum.Font.GothamBold; title.TextSize = 14; title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = Color3.fromRGB(235, 241, 255); title.Text = "AERO V15  |  3D ANIMATION LAB"; title.Parent = top
+    title.TextColor3 = Color3.fromRGB(235, 241, 255); title.Text = "AERO V16  |  FULL PLACE ANIMATION LAB"; title.Parent = top
     local close = Instance.new("TextButton")
     close.Size = UDim2.fromOffset(32, 28); close.Position = UDim2.new(1, -38, 0, 5); close.Text = "×"
     close.Font = Enum.Font.GothamBold; close.TextSize = 20; close.TextColor3 = Color3.new(1,1,1)
@@ -3684,7 +3744,7 @@ openAnimationLabPanel = function()
         local id = State.AnimationLabSelectedId
         if not id then return end
         State.AnimationLabMarks[id] = kind
-        print(string.format("[Aero V15 LAB] marked | id=%s | type=%s", id, kind))
+        print(string.format("[Aero V16 LAB] marked | id=%s | type=%s", id, kind))
         if State.AnimationLabInfo then State.AnimationLabInfo.Text = "Selected: " .. id .. "\nMarked as: " .. kind end
     end
     mkButton("ATTACK", 12, 88, function() mark("Attack") end).Position = UDim2.fromOffset(12, 0)
@@ -3698,7 +3758,7 @@ openAnimationLabPanel = function()
     viewport.Position = UDim2.fromOffset(12, 88); viewport.Size = UDim2.fromOffset(390, 317)
     list.Position = UDim2.fromOffset(414, 88); list.Size = UDim2.fromOffset(334, 317)
     info.Position = UDim2.fromOffset(12, 413)
-    State.AnimationLabInfo.Text = "R6 preview uses your current character rig. If your avatar is R15, this viewport will be R15 instead.\nScan to populate the list."
+    State.AnimationLabInfo.Text = "Scans client-visible assets across the DataModel. Enter each mini-game/mode, then SCAN again; discoveries accumulate.\nPreview rig follows your current avatar rig."
     if refreshAnimationLabList then refreshAnimationLabList() end
 end
 
@@ -3881,4 +3941,5 @@ if false and (UIRefs.Gradient or UIRefs.Shimmer) then
     addThread(thread)
 end
 
-print("[Aero] Revengers X toolkit V15 initialized. Animation Lab includes a local 3D viewport, catalog list, sequential preview and manual Attack/Movement labels. Some styles may load lazily; re-scan after switching styles. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
+pcall(installAnimationLiveHooks)
+print("[Aero] Revengers X toolkit V16 initialized. Animation Lab scans client-visible DataModel descendants across services, watches dynamically added Animation instances and Animator.AnimationPlayed events, and previews assets on a local viewport rig. Re-scan after entering mini-games or loading new modes; inaccessible or never-loaded server assets cannot be enumerated from the client. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
