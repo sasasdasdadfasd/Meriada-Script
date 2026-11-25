@@ -1,5 +1,5 @@
 --[=[
-    Revengers X | Aero Combat Toolkit V5 - Mercedes-style UI port
+    Revengers X | Aero Combat Toolkit V8 - WindUI + utility integrations
     Client-side Luau utility for Roblox executors.
 
     IMPORTANT LIMITATIONS
@@ -8,11 +8,17 @@
     - Learn Mode logs nearby tracks and can correlate a recent local health decrease with the closest active attack track.
     - Remote input is supported only through an explicit RemoteAdapter configured below.
     - The target scanner watches Animator descendants in other player characters. NPC-only targets are not included.
-    - Immediate response mode guards through nearby candidate tracks only when the attacker faces or moves toward the local character.
+    - Immediate response mode rechecks an AnimationPlayed track after a short grace period, then guards only nearby candidates facing or moving toward the local character.
     - An animation track alone does not expose its victim/hitbox; facing and movement are directional heuristics. If the game does not replicate the track to this client, client-side detection cannot see it.
 
     Recommended: use key input first. Configure exact animation timings only after observing the
     game's animations in Learn mode. This file has not been run inside Roblox or an executor here.
+
+    V8 integration notes (adapted patterns; no foreign game IDs/remotes copied):
+    - Animation marker observation: https://github.com/Zyn-ic/AnimateService
+    - Config UI foundation: https://github.com/Footagesus/WindUI
+    - Cooldown utility pattern: https://github.com/merani2/Roblox-Luau-Utilities
+    - Combat diagnostics / event separation inspiration: https://github.com/Diogo-S-Oliveira/CombatSystem-Roblox-MVP
 ]=]
 
 -- Avoid stacking duplicate copies when the executor reruns this file.
@@ -27,7 +33,7 @@ end)
 --==============================================================
 
 local CONFIG = {
-    Version = 4,
+    Version = 8,
     MenuKey = "RightShift",
     BlockKey = "F",
     DodgeKey = "Q",
@@ -83,6 +89,7 @@ local CONFIG = {
     PriorityFilter = false,
     DebugCombat = true,
     AnimatorPollInterval = 0.05,
+    EventConfirmDelay = 0.045,      -- short re-check to discard tracks cancelled immediately (possible feints)
     UseMovementDirection = true,
     MinAttackerSpeed = 2.25,
     VelocityTowardDot = 0.35,
@@ -122,6 +129,9 @@ local State = {
     LastAnimatorPoll = 0,
     LastSensorRefresh = 0,
     LastDebug = {},
+    DebugEntries = {},
+    LastMarker = "none",
+    LastMarkerAt = 0,
     StartedAt = os.clock(),
     Diagnostics = {
         AnimatorsBound = 0,
@@ -240,6 +250,9 @@ local function debugLog(key, message, interval)
     local delay = interval or 1.0
     if now - (State.LastDebug[key] or -math.huge) < delay then return end
     State.LastDebug[key] = now
+    local entry = string.format("[%.3f] %s", now - State.StartedAt, tostring(message))
+    table.insert(State.DebugEntries, entry)
+    if #State.DebugEntries > 80 then table.remove(State.DebugEntries, 1) end
     print("[Aero Debug] " .. tostring(message))
 end
 
@@ -250,6 +263,37 @@ end
 local function clamp(value, minimum, maximum)
     return math.max(minimum, math.min(maximum, value))
 end
+
+-- Small keyed cooldown utility adapted from common open-source Luau cooldown patterns.
+-- Kept local so Aero does not need an extra ModuleScript or unpinned dependency.
+local CooldownGate = {}
+CooldownGate.__index = CooldownGate
+
+function CooldownGate.new(duration)
+    return setmetatable({ Duration = math.max(0, tonumber(duration) or 0), ReadyAt = 0 }, CooldownGate)
+end
+
+function CooldownGate:Remaining(now)
+    return math.max(0, self.ReadyAt - (now or os.clock()))
+end
+
+function CooldownGate:IsReady(now)
+    return self:Remaining(now) <= 0
+end
+
+function CooldownGate:Use(now, duration)
+    now = now or os.clock()
+    if not self:IsReady(now) then return false, self:Remaining(now) end
+    if duration ~= nil then self.Duration = math.max(0, tonumber(duration) or self.Duration) end
+    self.ReadyAt = now + self.Duration
+    return true, 0
+end
+
+function CooldownGate:Reset()
+    self.ReadyAt = 0
+end
+
+local DodgeCooldownGate = CooldownGate.new(CONFIG.DodgeCooldown)
 
 local function getKeyCode(keyName)
     local result
@@ -668,6 +712,7 @@ local function registerTrack(player, animator, track)
         Distance = math.huge,
         BlockTriggered = false,
         EventTriggered = false,
+        EventConfirmed = false,
         DodgeTriggered = false,
         RecoveryTriggered = false,
         ZeroLengthTriggered = false,
@@ -676,29 +721,68 @@ local function registerTrack(player, animator, track)
     }
     table.insert(State.ActiveTracks, record)
 
-    -- Event-driven fast path: request defense in the AnimationPlayed callback itself,
-    -- instead of waiting for the next Heartbeat scan. This is the earliest client-side
-    -- reaction available from the replicated track event.
+    -- Marker observer inspired by open animation-signal patterns. Marker names are
+    -- observations only: they are not assumed to represent Revengers X hitboxes.
+    if track and type(track.GetMarkerReachedSignal) == "function" then
+        for _, markerName in ipairs({ "Hit", "Hit1", "Hit2", "Impact", "Damage", "Strike", "Hitbox", "Attack" }) do
+            local okSignal, markerSignal = pcall(function()
+                return track:GetMarkerReachedSignal(markerName)
+            end)
+            if okSignal and markerSignal then
+                connect(markerSignal, function(markerValue)
+                    local stamp = os.clock()
+                    State.LastMarker = player.Name .. ":" .. markerName
+                    State.LastMarkerAt = stamp
+                    debugLog("marker_" .. tostring(player.UserId) .. "_" .. markerName,
+                        string.format("animation marker: player=%s id=%s marker=%s value=%s",
+                            player.Name, animationId, markerName, tostring(markerValue)), 0.15)
+                end)
+            end
+        end
+    end
+
+    -- Event-driven fast path inspired by the AnimationPlayed listener pattern found
+    -- in the reference source. Revalidate once after a tiny grace period: some games
+    -- start and immediately cancel feint/transition tracks. No foreign game IDs/remotes
+    -- are imported; the target and animation are validated against this script's config.
     if CONFIG.AutoBlock and CONFIG.ResponseMode == "Immediate"
         and ((not CONFIG.PriorityFilter) or actionTrack) then
+        record.EventTriggered = true
         local _, targetHumanoid, targetRoot = getCharacterParts(player)
-        local eligible, distance, rejectReason, facingDot, velocityDot =
-            isTargetEligible(player, targetHumanoid, targetRoot)
+        local eligible, distance, rejectReason = isTargetEligible(player, targetHumanoid, targetRoot)
         if eligible then
-            local now = os.clock()
-            local hold = math.max(CONFIG.ZeroLengthHold, CONFIG.BlockHoldAfterImpact) + CONFIG.ComboGap
-            State.Diagnostics.LastTarget = player.Name
-            State.Diagnostics.LastDistance = distance
-            State.Diagnostics.LastFacingDot = tonumber(facingDot) or -1
-            State.Diagnostics.LastVelocityDot = tonumber(velocityDot) or -1
-            State.LastThreatAt = now
-            State.LastThreatPlayer = player
-            record.Distance = distance
-            record.LastEligibleAt = now
-            requestBlock(now + hold, now, "AnimationPlayed directed event")
-            record.EventTriggered = true
-            record.BlockTriggered = true
-            setActionHeld("Block", CONFIG.BlockKey, true)
+            task.delay(math.max(0, tonumber(CONFIG.EventConfirmDelay) or 0), function()
+                if State.Unloaded or not CONFIG.AutoBlock or record.EventConfirmed or record.BlockTriggered then return end
+                local stillPlaying = false
+                pcall(function() stillPlaying = track.IsPlaying end)
+                if not stillPlaying then
+                    State.Diagnostics.LastReject = "track cancelled during event confirmation"
+                    return
+                end
+                local _, currentHumanoid, currentRoot = getCharacterParts(player)
+                local stillEligible, currentDistance, currentReason, currentFacing, currentVelocity =
+                    isTargetEligible(player, currentHumanoid, currentRoot)
+                if not stillEligible then
+                    State.Diagnostics.LastReject = currentReason or "target failed event re-check"
+                    debugLog("event_recheck_reject_" .. tostring(player.UserId),
+                        "AnimationPlayed re-check rejected: " .. tostring(State.Diagnostics.LastReject), 0.75)
+                    return
+                end
+                local now = os.clock()
+                local hold = math.max(CONFIG.ZeroLengthHold, CONFIG.BlockHoldAfterImpact) + CONFIG.ComboGap
+                record.EventConfirmed = true
+                record.BlockTriggered = true
+                record.Distance = currentDistance
+                record.LastEligibleAt = now
+                State.Diagnostics.LastTarget = player.Name
+                State.Diagnostics.LastDistance = currentDistance
+                State.Diagnostics.LastFacingDot = tonumber(currentFacing) or -1
+                State.Diagnostics.LastVelocityDot = tonumber(currentVelocity) or -1
+                State.LastThreatAt = now
+                State.LastThreatPlayer = player
+                requestBlock(now + hold, now, "validated AnimationPlayed event")
+                setActionHeld("Block", CONFIG.BlockKey, true)
+            end)
         else
             State.Diagnostics.LastReject = rejectReason or "target not eligible at AnimationPlayed"
             debugLog("event_reject_" .. tostring(player.UserId),
@@ -863,12 +947,20 @@ end
 
 local function tryDodge(now, impactAt)
     if not CONFIG.AutoDodge then return false end
-    if now - State.LastDodgeAt < CONFIG.DodgeCooldown then return false end
+    DodgeCooldownGate.Duration = math.max(0, tonumber(CONFIG.DodgeCooldown) or 1.1)
+    local cooldownReady = DodgeCooldownGate:Use(now, DodgeCooldownGate.Duration)
+    if not cooldownReady then
+        debugLog("dodge_cooldown", string.format("Dodge cooldown: %.2fs remaining", DodgeCooldownGate:Remaining(now)), 0.5)
+        return false
+    end
 
     -- Avoid overlapping a block and dodge keypress.
     setActionHeld("Block", CONFIG.BlockKey, false)
     local started = setActionHeld("Dodge", CONFIG.DodgeKey, true)
-    if not started then return false end
+    if not started then
+        DodgeCooldownGate:Reset()
+        return false
+    end
 
     State.LastDodgeAt = now
     State.DodgeUntil = now + CONFIG.DodgeTapDuration
@@ -1007,17 +1099,16 @@ local function combatStep()
 
                 if priorityAccepted and age <= CONFIG.MaxTrackAge then
                     if CONFIG.ResponseMode == "Immediate" then
-                        -- Strong guard mode: don't guess a hit-frame. Hold block while a nearby,
-                        -- eligible non-looped track is active, refreshing the lease every frame.
-                        -- This also keeps the block alive while track.Length is still zero/loading.
-                        if CONFIG.AutoBlock then
+                        -- Wait for the AnimationPlayed event's brief confirmation pass before
+                        -- holding block. This filters tracks that are cancelled almost instantly.
+                        if CONFIG.AutoBlock and record.EventConfirmed then
                             local positionNow = math.max(0, tonumber(timePosition) or 0)
                             local remainingNow = CONFIG.ZeroLengthHold
                             if record.Length > 0 then
                                 remainingNow = clamp((record.Length - positionNow) / safeSpeed, 0, CONFIG.MaxBlockCommit)
                             end
                             requestBlock(now + math.max(CONFIG.BlockHoldAfterImpact, remainingNow) + CONFIG.ComboGap,
-                                now, record.Length > 0 and "immediate nearby animation" or "animation length loading")
+                                now, record.Length > 0 and "confirmed nearby animation" or "confirmed animation length loading")
                             record.BlockTriggered = true
                         end
                     else
@@ -2137,6 +2228,359 @@ local function makeUI()
     toast("Aero loaded  •  RightShift to toggle")
 end
 --==============================================================
+-- WindUI menu adapter (Aero tabs and controls)
+-- WindUI is pinned to a reviewed commit instead of tracking main.
+--==============================================================
+local AeroWindow
+local AeroWindUI
+
+local function aeroNotify(title, content, icon)
+    if AeroWindUI then
+        pcall(function()
+            AeroWindUI:Notify({ Title = title, Content = content, Icon = icon or "info", Duration = 3 })
+        end)
+    else
+        toast(title .. ": " .. content)
+    end
+end
+
+local function saveAeroConfig()
+    local writeFn = capability("writefile")
+    if type(writeFn) ~= "function" or not HttpService then
+        aeroNotify("Config", "writefile unavailable", "alert-circle")
+        return
+    end
+    local keys = {
+        "Version", "MenuKey", "BlockKey", "DodgeKey", "AutoBlock", "AutoDodge", "ResponseMode",
+        "IgnoreSameTeam", "FacingCheck", "FacingDot", "MaxDistance", "PingCompensation", "ManualPingMs",
+        "BlockLead", "DodgeLead", "DodgeCooldown", "DodgeTapDuration", "BlockHoldAfterImpact", "ComboGap",
+        "LateWindow", "MaxBlockCommit", "UseKeyframeMarkers", "EarlyActionGuard", "FilterMode", "ImpactRatio",
+        "InputMode", "InputMethod", "WindowTransparency", "Accent", "AnimateHeader", "LearnedTimings",
+        "AttackWhitelist", "LearnDistance", "ZeroLengthFallback", "ZeroLengthHold", "MaxTrackAge",
+        "PriorityFilter", "UseMovementDirection", "MinAttackerSpeed", "VelocityTowardDot", "ThreatGrace",
+        "RecoveryEnabled", "RecoveryWindow", "RecoveryBlockHold", "LearnMode"
+    }
+    local data = {}
+    for _, key in ipairs(keys) do data[key] = CONFIG[key] end
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+    if not ok then aeroNotify("Config", "JSON encode failed", "alert-circle"); return end
+    local wrote = pcall(writeFn, "Aero_RevengersX_Config.json", encoded)
+    aeroNotify("Config", wrote and "Saved Aero_RevengersX_Config.json" or "Save failed", wrote and "check" or "alert-circle")
+end
+
+local function loadAeroConfig()
+    local readFn, isfileFn = capability("readfile"), capability("isfile")
+    if type(readFn) ~= "function" or not HttpService then
+        aeroNotify("Config", "readfile unavailable", "alert-circle")
+        return
+    end
+    if type(isfileFn) == "function" then
+        local ok, exists = pcall(isfileFn, "Aero_RevengersX_Config.json")
+        if not ok or not exists then aeroNotify("Config", "Config file not found", "alert-circle"); return end
+    end
+    local okRead, raw = pcall(readFn, "Aero_RevengersX_Config.json")
+    if not okRead or type(raw) ~= "string" then aeroNotify("Config", "Read failed", "alert-circle"); return end
+    local okDecode, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not okDecode or type(data) ~= "table" then aeroNotify("Config", "Invalid JSON", "alert-circle"); return end
+    for key, value in pairs(data) do
+        if key ~= "RemoteAdapter" and DEFAULTS[key] ~= nil and type(value) == type(DEFAULTS[key]) then
+            CONFIG[key] = value
+        end
+    end
+    CONFIG.MaxDistance = clamp(tonumber(CONFIG.MaxDistance) or 34, 5, 100)
+    CONFIG.FacingDot = clamp(tonumber(CONFIG.FacingDot) or 0.05, -1, 1)
+    CONFIG.VelocityTowardDot = clamp(tonumber(CONFIG.VelocityTowardDot) or 0.35, -1, 1)
+    if not getKeyCode(CONFIG.MenuKey) then CONFIG.MenuKey = DEFAULTS.MenuKey end
+    if not getKeyCode(CONFIG.BlockKey) then CONFIG.BlockKey = DEFAULTS.BlockKey end
+    if not getKeyCode(CONFIG.DodgeKey) then CONFIG.DodgeKey = DEFAULTS.DodgeKey end
+    aeroNotify("Config", "Loaded. Reopen menu if a control does not refresh.", "check")
+end
+
+local function sanitizeProfileName(name)
+    name = tostring(name or "Default")
+    name = string.gsub(name, "[^%w_%-]", "_")
+    name = string.sub(name, 1, 32)
+    if name == "" then name = "Default" end
+    return name
+end
+
+local function profilePath(name)
+    return "Aero_RevengersX/Profiles/" .. sanitizeProfileName(name) .. ".json"
+end
+
+local function ensureProfileFolders()
+    local makeFolder = capability("makefolder")
+    if type(makeFolder) == "function" then
+        pcall(makeFolder, "Aero_RevengersX")
+        pcall(makeFolder, "Aero_RevengersX/Profiles")
+    end
+end
+
+local function getConfigSnapshot()
+    local keys = {
+        "Version", "MenuKey", "BlockKey", "DodgeKey", "AutoBlock", "AutoDodge", "ResponseMode",
+        "IgnoreSameTeam", "FacingCheck", "FacingDot", "MaxDistance", "PingCompensation", "ManualPingMs",
+        "BlockLead", "DodgeLead", "DodgeCooldown", "DodgeTapDuration", "BlockHoldAfterImpact", "ComboGap",
+        "LateWindow", "MaxBlockCommit", "UseKeyframeMarkers", "EarlyActionGuard", "FilterMode", "ImpactRatio",
+        "InputMode", "InputMethod", "WindowTransparency", "Accent", "AnimateHeader", "LearnedTimings",
+        "AttackWhitelist", "LearnDistance", "ZeroLengthFallback", "ZeroLengthHold", "MaxTrackAge",
+        "PriorityFilter", "UseMovementDirection", "MinAttackerSpeed", "VelocityTowardDot", "ThreatGrace",
+        "RecoveryEnabled", "RecoveryWindow", "RecoveryBlockHold", "LearnMode"
+    }
+    local data = {}
+    for _, key in ipairs(keys) do data[key] = CONFIG[key] end
+    return data
+end
+
+local function saveNamedProfile(name)
+    local writeFn = capability("writefile")
+    if type(writeFn) ~= "function" or not HttpService then
+        aeroNotify("Profiles", "Executor file API unavailable", "alert-circle")
+        return
+    end
+    ensureProfileFolders()
+    local path = profilePath(name)
+    local okEncode, encoded = pcall(function() return HttpService:JSONEncode(getConfigSnapshot()) end)
+    if not okEncode then aeroNotify("Profiles", "JSON encode failed", "alert-circle"); return end
+    local okWrite = pcall(writeFn, path, encoded)
+    aeroNotify("Profiles", okWrite and ("Saved " .. sanitizeProfileName(name)) or "Save failed", okWrite and "check" or "alert-circle")
+end
+
+local function loadNamedProfile(name)
+    local readFn, isfileFn = capability("readfile"), capability("isfile")
+    if type(readFn) ~= "function" or not HttpService then
+        aeroNotify("Profiles", "Executor file API unavailable", "alert-circle")
+        return
+    end
+    local path = profilePath(name)
+    if type(isfileFn) == "function" then
+        local okExists, exists = pcall(isfileFn, path)
+        if not okExists or not exists then aeroNotify("Profiles", "Profile not found: " .. sanitizeProfileName(name), "alert-circle"); return end
+    end
+    local okRead, raw = pcall(readFn, path)
+    if not okRead or type(raw) ~= "string" then aeroNotify("Profiles", "Profile read failed", "alert-circle"); return end
+    local okDecode, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not okDecode or type(data) ~= "table" then aeroNotify("Profiles", "Profile JSON is invalid", "alert-circle"); return end
+    for key, value in pairs(data) do
+        if key ~= "RemoteAdapter" and DEFAULTS[key] ~= nil and type(value) == type(DEFAULTS[key]) then
+            CONFIG[key] = value
+        end
+    end
+    CONFIG.MaxDistance = clamp(tonumber(CONFIG.MaxDistance) or 34, 5, 100)
+    CONFIG.DodgeCooldown = clamp(tonumber(CONFIG.DodgeCooldown) or 1.1, 0.1, 10)
+    DodgeCooldownGate.Duration = CONFIG.DodgeCooldown
+    DodgeCooldownGate:Reset()
+    aeroNotify("Profiles", "Loaded " .. sanitizeProfileName(name) .. " — restart script to refresh all controls", "check")
+end
+
+local function printDebugSnapshot()
+    local d = State.Diagnostics
+    local remaining = DodgeCooldownGate:Remaining()
+    print(string.format(
+        "[Aero Monitor] uptime=%.1fs | animators=%d | seen=%d | accepted=%d | rejected=%d | blocks=%d | target=%s | distance=%.1f | marker=%s | dodgeCD=%.2fs | reject=%s",
+        os.clock() - State.StartedAt, d.AnimatorsBound, d.TracksSeen, d.TracksAccepted, d.TracksRejected,
+        d.BlockRequests, tostring(d.LastTarget), tonumber(d.LastDistance) or 0, tostring(State.LastMarker),
+        remaining, tostring(d.LastReject)
+    ))
+    aeroNotify("Combat Monitor", "Snapshot printed to F9 console", "activity")
+end
+
+local function printRecentDebug()
+    print("[Aero Debug Console] ---- recent events ----")
+    local first = math.max(1, #State.DebugEntries - 24)
+    for i = first, #State.DebugEntries do print(State.DebugEntries[i]) end
+    print("[Aero Debug Console] ---- end ----")
+    aeroNotify("Debug Console", "Recent events printed to F9", "terminal")
+end
+
+local function windToggle(tab, title, key, desc)
+    return tab:Toggle({
+        Title = title, Desc = desc, Value = CONFIG[key] == true,
+        Callback = function(value)
+            CONFIG[key] = value == true
+            if key == "LearnMode" then
+                aeroNotify("Learn Mode", value and "Enabled — inspect F9 console" or "Stopped", "brain")
+            elseif key == "AnimateHeader" then
+                CONFIG.AnimateHeader = value == true
+            end
+        end,
+    })
+end
+
+local function windSlider(tab, title, key, minimum, maximum, step, desc)
+    return tab:Slider({
+        Title = title, Desc = desc, Step = step,
+        Value = { Min = minimum, Max = maximum, Default = tonumber(CONFIG[key]) or minimum },
+        Callback = function(value) CONFIG[key] = tonumber(value) or CONFIG[key] end,
+    })
+end
+
+local function windCycle(tab, title, key, values, desc)
+    return tab:Dropdown({
+        Title = title, Desc = desc, Values = values, Value = CONFIG[key], AllowNone = false,
+        Callback = function(value)
+            if type(value) == "string" then CONFIG[key] = value end
+        end,
+    })
+end
+
+local function makeWindUI()
+    local ok, result = pcall(function()
+        local source = "https://raw.githubusercontent.com/Footagesus/WindUI/d2c9bac5f96f997418d680d19cb759892542e492/dist/main.lua"
+        return loadstring(game:HttpGet(source))()
+    end)
+    if not ok or not result then
+        notifyWarn("WindUI failed to load; falling back to the built-in Aero menu. " .. tostring(result))
+        makeUI()
+        return
+    end
+    AeroWindUI = result
+
+    AeroWindow = AeroWindUI:CreateWindow({
+        Title = "AERO  |  REVENGERS X",
+        Icon = "solar:shield-check-bold",
+        Theme = "Dark",
+        Folder = "Aero_RevengersX",
+        NewElements = true,
+        HideSearchBar = false,
+        Topbar = { Height = 44, ButtonsType = "Mac" },
+        OpenButton = {
+            Title = "Open AERO",
+            Enabled = true,
+            Draggable = true,
+            OnlyMobile = false,
+            CornerRadius = UDim.new(1, 0),
+        },
+    })
+    if not AeroWindow then notifyWarn("WindUI window creation failed"); return end
+    pcall(function() AeroWindow:Tag({ Title = "AERO V7", Icon = "github", Color = Color3.fromHex("#7775F2"), Border = true }) end)
+
+    local combat = AeroWindow:Tab({ Title = "Combat", Icon = "solar:shield-bold", Border = true })
+    local settings = AeroWindow:Tab({ Title = "Settings", Icon = "solar:settings-bold", Border = true })
+    local theme = AeroWindow:Tab({ Title = "Theme", Icon = "solar:palette-bold", Border = true })
+
+    combat:Section({ Title = "Defense" })
+    windToggle(combat, "Auto Block", "AutoBlock", "Automatically request block when a threat candidate is confirmed")
+    combat:Keybind({ Title = "Block key", Value = CONFIG.BlockKey, Callback = function(value)
+        if type(value) == "string" then CONFIG.BlockKey = value end
+    end })
+    windToggle(combat, "Auto Dodge", "AutoDodge", "Optional dodge response; disabled by default")
+    combat:Keybind({ Title = "Dodge key", Value = CONFIG.DodgeKey, Callback = function(value)
+        if type(value) == "string" then CONFIG.DodgeKey = value end
+    end })
+    windCycle(combat, "Response mode", "ResponseMode", { "Immediate", "Timed" })
+    windToggle(combat, "Require attack aimed at me", "FacingCheck")
+    windToggle(combat, "Ignore same Roblox Team", "IgnoreSameTeam")
+    windToggle(combat, "Ping compensation", "PingCompensation")
+    windToggle(combat, "Post-hit recovery", "RecoveryEnabled")
+
+    combat:Section({ Title = "Detection" })
+    windSlider(combat, "Max threat distance", "MaxDistance", 5, 40, 1)
+    windSlider(combat, "Block lead (sec)", "BlockLead", 0.05, 0.60, 0.01)
+    windSlider(combat, "Facing threshold", "FacingDot", -0.35, 0.9, 0.01)
+    windSlider(combat, "Move-toward threshold", "VelocityTowardDot", -0.25, 0.95, 0.01)
+    windSlider(combat, "Minimum attacker speed", "MinAttackerSpeed", 0.5, 12, 0.1)
+    windSlider(combat, "Learn distance", "LearnDistance", 5, 35, 1)
+    windToggle(combat, "Zero-length fallback", "ZeroLengthFallback")
+    windToggle(combat, "Use named hit keyframes", "UseKeyframeMarkers")
+    windToggle(combat, "Early guard on Action animations", "EarlyActionGuard")
+    windCycle(combat, "Animation filter", "FilterMode", { "ThreatCandidate", "NonLooped", "All", "Whitelist" })
+    combat:Input({ Title = "Animation whitelist IDs", Desc = "Comma-separated numeric or asset IDs", Value = table.concat(CONFIG.AttackWhitelist or {}, ","), Placeholder = "12345, 67890", Callback = function(value)
+        local ids = {}
+        for token in string.gmatch(tostring(value or ""), "[^,]+") do
+            local id = string.gsub(token, "%s+", "")
+            if id ~= "" then table.insert(ids, id) end
+        end
+        CONFIG.AttackWhitelist = ids
+    end })
+
+    combat:Section({ Title = "Learning and diagnostics" })
+    windToggle(combat, "Learn Mode", "LearnMode", "Logs nearby unknown animation tracks; review F9 console")
+    combat:Button({ Title = "Test block input", Icon = "shield", Callback = function()
+        local sent = pulseAction("Block", CONFIG.BlockKey, 0.16)
+        aeroNotify("Input test", sent and "Block input sent" or "Block input unavailable", sent and "check" or "alert-circle")
+    end })
+    combat:Button({ Title = "Test dodge input", Icon = "move-right", Callback = function()
+        local sent = pulseAction("Dodge", CONFIG.DodgeKey, CONFIG.DodgeTapDuration)
+        aeroNotify("Input test", sent and "Dodge input sent" or "Dodge input unavailable", sent and "check" or "alert-circle")
+    end })
+    combat:Button({ Title = "Reset learned timings", Icon = "refresh-ccw", Callback = function()
+        CONFIG.LearnedTimings = {}; State.LastLearnLog = {}
+        aeroNotify("Learn Mode", "Learned timing estimates cleared", "check")
+    end })
+    combat:Button({ Title = "Print combat diagnostics", Icon = "terminal", Callback = function()
+        local d = State.Diagnostics
+        print(string.format("[Aero Status] animators=%d tracksSeen=%d tracksAccepted=%d tracksRejected=%d blockRequests=%d target=%s distance=%.1f facing=%.2f velocity=%.2f lastReject=%s lastBlock=%s",
+            d.AnimatorsBound, d.TracksSeen, d.TracksAccepted, d.TracksRejected, d.BlockRequests,
+            tostring(d.LastTarget), tonumber(d.LastDistance) or 0, tonumber(d.LastFacingDot) or -1,
+            tonumber(d.LastVelocityDot) or -1, tostring(d.LastReject), tostring(d.LastBlockReason)))
+        aeroNotify("Diagnostics", "Printed to F9 console", "terminal")
+    end })
+
+    combat:Section({ Title = "Animation markers / debug console" })
+    combat:Paragraph({ Title = "Marker observer", Desc = "Listens for common marker names (Hit, Impact, Damage, Strike, Hitbox, Attack). Marker events are diagnostic only; they are not verified hitboxes." })
+    combat:Button({ Title = "Live monitor snapshot", Icon = "activity", Callback = printDebugSnapshot })
+    combat:Button({ Title = "Print recent debug events", Icon = "terminal", Callback = printRecentDebug })
+    combat:Button({ Title = "Clear debug events", Icon = "trash-2", Callback = function()
+        State.DebugEntries = {}
+        aeroNotify("Debug Console", "Event buffer cleared", "check")
+    end })
+
+    settings:Section({ Title = "Input backend" })
+    windCycle(settings, "Input mode", "InputMode", { "Auto", "Key", "Remote" })
+    windCycle(settings, "Key sender", "InputMethod", { "VIM", "keypress", "both" })
+    settings:Keybind({ Title = "Menu hotkey", Value = CONFIG.MenuKey, Callback = function(value)
+        if type(value) == "string" then
+            CONFIG.MenuKey = value
+            local enum = getKeyCode(value)
+            if enum then pcall(function() AeroWindow:SetToggleKey(enum) end) end
+        end
+    end })
+    settings:Section({ Title = "Reliability" })
+    windSlider(settings, "Dodge cooldown (sec)", "DodgeCooldown", 0.25, 3, 0.01)
+    windSlider(settings, "Dodge tap (sec)", "DodgeTapDuration", 0.05, 0.30, 0.01)
+    windSlider(settings, "Combo gap (sec)", "ComboGap", 0.05, 0.80, 0.01)
+    windSlider(settings, "Max block commitment (sec)", "MaxBlockCommit", 0.20, 2.50, 0.01)
+    windSlider(settings, "Manual ping fallback (ms)", "ManualPingMs", 0, 300, 1)
+    settings:Button({ Title = "Save config (JSON)", Icon = "save", Callback = saveAeroConfig })
+    settings:Button({ Title = "Load config (JSON)", Icon = "folder-open", Callback = loadAeroConfig })
+    local selectedProfile = "Default"
+    settings:Section({ Title = "Config Manager — named profiles" })
+    settings:Input({ Title = "Profile name", Desc = "Letters, numbers, underscore and dash are retained", Value = selectedProfile, Placeholder = "Default", Callback = function(value)
+        selectedProfile = sanitizeProfileName(value)
+    end })
+    settings:Button({ Title = "Save named profile", Icon = "save", Callback = function()
+        saveNamedProfile(selectedProfile)
+    end })
+    settings:Button({ Title = "Load named profile", Icon = "folder-open", Callback = function()
+        loadNamedProfile(selectedProfile)
+    end })
+    settings:Button({ Title = "Unload script", Icon = "power", Color = Color3.fromHex("#D94A5A"), Callback = function()
+        if type(_G.AERO_REVENGERS_UNLOAD) == "function" then _G.AERO_REVENGERS_UNLOAD() end
+    end })
+
+    theme:Section({ Title = "Appearance" })
+    theme:Paragraph({ Title = "WindUI Dark", Desc = "Aero uses the WindUI dark interface theme. The original Combat, Settings and Theme groups are preserved as tabs." })
+    windToggle(theme, "Animated header preference", "AnimateHeader", "Retained in Aero config; WindUI controls its own window animation")
+    windSlider(theme, "Saved transparency preference", "WindowTransparency", 0, 0.35, 0.01, "Stored in config for compatibility with Aero settings")
+    theme:Button({ Title = "Silver preset", Icon = "palette", Callback = function()
+        CONFIG.Accent = { 220, 231, 255 }; aeroNotify("Theme", "Silver preset saved", "check")
+    end })
+    theme:Button({ Title = "Lilac preset", Icon = "palette", Callback = function()
+        CONFIG.Accent = { 194, 168, 220 }; aeroNotify("Theme", "Lilac preset saved", "check")
+    end })
+    theme:Button({ Title = "Ice preset", Icon = "palette", Callback = function()
+        CONFIG.Accent = { 164, 179, 218 }; aeroNotify("Theme", "Ice preset saved", "check")
+    end })
+
+    pcall(function()
+        local menuKey = getKeyCode(CONFIG.MenuKey)
+        if menuKey then AeroWindow:SetToggleKey(menuKey) end
+    end)
+    aeroNotify("AERO", "WindUI menu loaded", "check")
+end
+
+--==============================================================
 -- Lifecycle / config callbacks / input events
 --==============================================================
 
@@ -2166,6 +2610,7 @@ local function unload()
         end)
     end
 
+    pcall(function() if AeroWindow then AeroWindow:Destroy() end end)
     pcall(function() if GUI then GUI:Destroy() end end)
     pcall(function() _G.AERO_REVENGERS_UNLOAD = nil end)
     notifyWarn("Unloaded; connections cleared and held input released.")
@@ -2258,10 +2703,10 @@ if RunService.Heartbeat then
     end)
 end
 
-makeUI()
+makeWindUI()
 
 -- Animated monochrome sheen. This is intentionally subtle and fully stopped by Unload.
-if UIRefs.Gradient or UIRefs.Shimmer then
+if false and (UIRefs.Gradient or UIRefs.Shimmer) then
     local thread = task.spawn(function()
         while not State.Unloaded do
             if CONFIG.AnimateHeader then
@@ -2293,4 +2738,4 @@ if UIRefs.Gradient or UIRefs.Shimmer then
     addThread(thread)
 end
 
-print("[Aero] Revengers X toolkit V5 initialized. Default response: target-directed Immediate block; Auto Dodge is off by default. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
+print("[Aero] Revengers X toolkit V8 initialized. Default response: target-directed Immediate block; Auto Dodge is off by default. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
