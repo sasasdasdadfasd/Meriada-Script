@@ -1,20 +1,21 @@
 --[=[
-    Revengers X | Aero Combat Toolkit V9 - damage-correlated animation learning
+    Revengers X | Aero Combat Toolkit V10 - local animation recorder
     Client-side Luau utility for Roblox executors.
 
     IMPORTANT LIMITATIONS
     - No Revengers X-specific attack IDs, hit markers, attributes or RemoteEvents were supplied.
     - Impact timing prefers common named keyframes when present, then falls back to an animation-ratio estimate.
-    - Learn Mode logs nearby tracks and can correlate a recent local health decrease with the closest active attack track.
+    - Learn Mode can correlate local health loss with a recently validated nearby opponent track; it does not dump all opponents' animation IDs.
     - Remote input is supported only through an explicit RemoteAdapter configured below.
-    - The target scanner watches Animator descendants in other player characters. NPC-only targets are not included.
+    - V10 records AnimationPlayed events from the LOCAL character and prints only those IDs in the self-recorder.
+    - Nearby NPC animations are sampled only when the LOCAL player loses health; regular NPC playback is silent.
     - Immediate response mode rechecks an AnimationPlayed track after a short grace period, then guards only nearby candidates facing or moving toward the local character.
     - An animation track alone does not expose its victim/hitbox; facing and movement are directional heuristics. If the game does not replicate the track to this client, client-side detection cannot see it.
 
     Recommended: use key input first. Configure exact animation timings only after observing the
-    game's animations in Learn mode. V9 adds damage-correlated nearby animation snapshots and learned-ID gating. This file has not been run inside Roblox or an executor here.
+    game's animations in Learn mode. This file has not been run inside Roblox or an executor here.
 
-    V9 integration notes (adapted patterns; no foreign game IDs/remotes copied):
+    V10 integration notes (adapted patterns; no foreign game IDs/remotes copied):
     - Animation marker observation: https://github.com/Zyn-ic/AnimateService
     - Config UI foundation: https://github.com/Footagesus/WindUI
     - Cooldown utility pattern: https://github.com/merani2/Roblox-Luau-Utilities
@@ -33,7 +34,7 @@ end)
 --==============================================================
 
 local CONFIG = {
-    Version = 9,
+    Version = 10,
     MenuKey = "RightShift",
     BlockKey = "F",
     DodgeKey = "Q",
@@ -67,7 +68,9 @@ local CONFIG = {
     AttackWhitelist = {},           -- add exact AnimationId strings here for Whitelist mode
     ImpactRatio = 0.72,              -- fallback estimated impact point; not a verified game marker
     LearnedTimings = {},             -- optional damage-correlated timing estimates; verify before relying on them
-    LearnMode = true,
+    LearnMode = false,
+    RecordSelfAnimations = true, -- log only this client character
+    NpcScanRadius = 10,
 
     InputMode = "Auto",             -- "Auto", "Key", "Remote"
     InputMethod = "VIM",            -- "VIM", "keypress", "both"
@@ -80,10 +83,7 @@ local CONFIG = {
     AnimateHeader = true,
 
     -- Detection safeguards / diagnostics.
-    LearnDistance = 10,
-    DamageScanRadius = 10,
-    LearnedOnlyBlock = true,
-    LearnedAttackIds = {},
+    LearnDistance = 24,
     UseKeyframeMarkers = true,
     EarlyActionGuard = true,
     ZeroLengthFallback = true,
@@ -125,8 +125,6 @@ local State = {
     MenuOpen = true,
     CurrentTab = "Combat",
     LastLearnLog = {},
-    DamageScanSerial = 0,
-    LastDamageScanAt = 0,
     KnownTracks = setmetatable({}, { __mode = "k" }),
     LastThreatAt = 0,
     LastThreatPlayer = nil,
@@ -140,6 +138,8 @@ local State = {
     StartedAt = os.clock(),
     Diagnostics = {
         AnimatorsBound = 0,
+        NpcAnimatorsBound = 0,
+        NpcTracksSeen = 0,
         TracksSeen = 0,
         TracksAccepted = 0,
         TracksRejected = 0,
@@ -693,15 +693,10 @@ local function registerTrack(player, animator, track)
         State.KnownTracks[track] = true
         State.Diagnostics.TracksRejected += 1
         State.Diagnostics.LastReject = CONFIG.FilterMode == "Whitelist" and "not in animation whitelist" or "looped animation"
-        debugLog("filtered_" .. animationId,
-            string.format("ignored filtered track: player=%s id=%s mode=%s", player.Name, animationId, CONFIG.FilterMode), 2.0)
         return
     end
 
     State.KnownTracks[track] = true
-    debugLog("track_" .. tostring(player.UserId) .. "_" .. animationId,
-        string.format("track seen: player=%s id=%s length=%.3f speed=%.2f priority=%s looped=%s",
-            player.Name, animationId, length, speed, tostring(priority), tostring(looped)), 0.75)
 
     -- Length == 0 is a normal Roblox loading state; keep the track and retry on Heartbeat.
     local record = {
@@ -738,9 +733,7 @@ local function registerTrack(player, animator, track)
                     local stamp = os.clock()
                     State.LastMarker = player.Name .. ":" .. markerName
                     State.LastMarkerAt = stamp
-                    debugLog("marker_" .. tostring(player.UserId) .. "_" .. markerName,
-                        string.format("animation marker: player=%s id=%s marker=%s value=%s",
-                            player.Name, animationId, markerName, tostring(markerValue)), 0.15)
+                    -- Marker observations remain internal; do not print remote-player animation IDs.
                 end)
             end
         end
@@ -750,9 +743,7 @@ local function registerTrack(player, animator, track)
     -- in the reference source. Revalidate once after a tiny grace period: some games
     -- start and immediately cancel feint/transition tracks. No foreign game IDs/remotes
     -- are imported; the target and animation are validated against this script's config.
-    local learnedAttack = CONFIG.LearnedAttackIds[animationId] == true
     if CONFIG.AutoBlock and CONFIG.ResponseMode == "Immediate"
-        and (not CONFIG.LearnedOnlyBlock or learnedAttack)
         and ((not CONFIG.PriorityFilter) or actionTrack) then
         record.EventTriggered = true
         local _, targetHumanoid, targetRoot = getCharacterParts(player)
@@ -771,8 +762,6 @@ local function registerTrack(player, animator, track)
                     isTargetEligible(player, currentHumanoid, currentRoot)
                 if not stillEligible then
                     State.Diagnostics.LastReject = currentReason or "target failed event re-check"
-                    debugLog("event_recheck_reject_" .. tostring(player.UserId),
-                        "AnimationPlayed re-check rejected: " .. tostring(State.Diagnostics.LastReject), 0.75)
                     return
                 end
                 local now = os.clock()
@@ -792,9 +781,6 @@ local function registerTrack(player, animator, track)
             end)
         else
             State.Diagnostics.LastReject = rejectReason or "target not eligible at AnimationPlayed"
-            debugLog("event_reject_" .. tostring(player.UserId),
-                string.format("AnimationPlayed ignored: player=%s reason=%s distance=%.2f",
-                    player.Name, tostring(rejectReason or "unknown"), tonumber(distance) or -1), 0.75)
         end
     end
 end
@@ -880,129 +866,64 @@ local function bindPlayer(player)
     if player.Character then bindCharacter(player, player.Character) end
 end
 
-
---==============================================================
--- V9: damage-correlated nearby animation capture
---==============================================================
-
-local function getTrackDetails(track)
-    local animationId, length, speed, priority, position, isPlaying
-    pcall(function()
-        local animation = track.Animation
-        animationId = animation and animation.AnimationId or "unknown"
-        length = track.Length
-        speed = track.Speed
-        priority = track.Priority
-        position = track.TimePosition
-        isPlaying = track.IsPlaying
-    end)
-    return tostring(animationId or "unknown"),
-        tonumber(length) or 0,
-        tonumber(speed) or 1,
-        tostring(priority or "Unknown"),
-        tonumber(position) or 0,
-        isPlaying == true
-end
-
-local function scanNearbyAnimations(reason, serial)
-    if State.Unloaded then return end
-    local _, _, localRoot = getCharacterParts(LocalPlayer)
-    if not localRoot then
-        print("[Aero V9 Learn] scan skipped: local root unavailable")
-        return
-    end
-
-    local radius = math.max(5, tonumber(CONFIG.DamageScanRadius) or 10)
-    local found, seenIds = 0, {}
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Character then
-            local character, humanoid, root = getCharacterParts(player)
-            if character and root and humanoid and humanoid.Health > 0 then
-                local distance = math.huge
-                pcall(function()
-                    distance = (localRoot.Position - root.Position).Magnitude
-                end)
-                if distance <= radius then
-                    local animators = {}
-                    pcall(function()
-                        for _, item in ipairs(character:GetDescendants()) do
-                            if item:IsA("Animator") then
-                                table.insert(animators, item)
-                                -- Bind the event stream too, so a track discovered by
-                                -- the damage scan can be recognized on its next replay.
-                                attachAnimator(player, item, State.CharacterConnections[player])
-                            end
-                        end
-                    end)
-
-                    -- Fallback for rigs exposing tracks through Humanoid instead of a
-                    -- discoverable Animator descendant.
-                    local tracks, trackOwner = {}, nil
-                    for _, animator in ipairs(animators) do
-                        local playing = {}
-                        pcall(function() playing = animator:GetPlayingAnimationTracks() end)
-                        for _, track in ipairs(playing) do
-                            table.insert(tracks, track)
-                            trackOwner = animator
-                        end
-                    end
-                    if #tracks == 0 then
-                        pcall(function()
-                            tracks = humanoid:GetPlayingAnimationTracks()
-                        end)
-                    end
-
-                    for _, track in ipairs(tracks) do
-                        local id, length, speed, priority, position, playing = getTrackDetails(track)
-                        if playing and id ~= "unknown" and id ~= "" then
-                            found += 1
-                            seenIds[id] = true
-                            CONFIG.LearnedAttackIds[id] = true
-                            print(string.format(
-                                "[Aero V9 Learn] damage-nearby animation | player=%s | id=%s | distance=%.2f | length=%.3f | speed=%.2f | priority=%s | position=%.3f | source=%s",
-                                player.Name, id, distance, length, speed, priority, position,
-                                trackOwner and "Animator" or "Humanoid fallback"
-                            ))
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    if found == 0 then
-        print(string.format(
-            "[Aero V9 Learn] no active nearby animation found after %s | radius=%.1f studs | check whether opponent animations replicate to this client",
-            tostring(reason or "damage"), radius
-        ))
-    else
-        local count = 0
-        for _ in pairs(seenIds) do count += 1 end
-        print(string.format("[Aero V9 Learn] captured %d active track(s), %d unique animation ID(s); IDs are candidates, not verified hitboxes",
-            found, count))
-    end
-end
-
-local function beginDamageAnimationScan()
-    State.DamageScanSerial += 1
-    local serial = State.DamageScanSerial
-    State.LastDamageScanAt = os.clock()
-    -- HealthChanged may fire a few frames after the animation's impact marker.
-    -- Multiple short snapshots improve the chance of catching a still-playing track.
-    for _, delaySeconds in ipairs({ 0, 0.08, 0.18, 0.32 }) do
-        task.delay(delaySeconds, function()
-            if State.Unloaded or serial ~= State.DamageScanSerial then return end
-            scanNearbyAnimations("local health decrease", serial)
-        end)
-    end
-end
-
 local function bindLocalCharacter(character)
     if State.Unloaded or not character then return end
     for _, connection in ipairs(State.LocalCharacterConnections) do
         pcall(function() connection:Disconnect() end)
     end
     State.LocalCharacterConnections = {}
+
+    local watchedLocalAnimators = setmetatable({}, { __mode = "k" })
+    local function logOwnAnimation(track, source)
+        if State.Unloaded or not CONFIG.RecordSelfAnimations or not track then return end
+        local animationId, animationName = "unknown", "unknown"
+        local length, speed, position, priority, looped = 0, 1, 0, "Unknown", false
+        pcall(function()
+            local animation = track.Animation
+            if animation then
+                animationId = animation.AnimationId or "unknown"
+                animationName = animation.Name or "unknown"
+            end
+            length = track.Length
+            speed = track.Speed
+            position = track.TimePosition
+            priority = track.Priority
+            looped = track.Looped
+        end)
+        animationId = tostring(animationId or "unknown")
+        if animationId == "" then animationId = "unknown" end
+        print(string.format(
+            "[Aero V10 SELF] PLAY | name=%s | id=%s | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | source=%s",
+            tostring(animationName), animationId, tonumber(length) or 0, tonumber(speed) or 1,
+            tonumber(position) or 0, tostring(priority), tostring(looped), tostring(source or "AnimationPlayed")
+        ))
+    end
+
+    local function attachOwnAnimator(animator)
+        if State.Unloaded or not animator or watchedLocalAnimators[animator] then return end
+        local isAnimator = false
+        pcall(function() isAnimator = animator:IsA("Animator") end)
+        if not isAnimator then return end
+        watchedLocalAnimators[animator] = true
+        connect(animator.AnimationPlayed, function(track)
+            logOwnAnimation(track, "AnimationPlayed")
+        end, State.LocalCharacterConnections)
+    end
+
+    local function inspectLocalDescendant(instance)
+        local isAnimator = false
+        pcall(function() isAnimator = instance:IsA("Animator") end)
+        if isAnimator then attachOwnAnimator(instance) end
+    end
+
+    for _, descendant in ipairs(character:GetDescendants()) do
+        inspectLocalDescendant(descendant)
+    end
+    connect(character.DescendantAdded, inspectLocalDescendant, State.LocalCharacterConnections)
+    if CONFIG.RecordSelfAnimations then
+        print("[Aero V10 SELF] Recorder ready. Perform your combo; your character's Animation IDs will appear below.")
+    end
+
     local thread = task.spawn(function()
         local humanoid
         local ok = pcall(function() humanoid = character:WaitForChild("Humanoid", 6) end)
@@ -1019,10 +940,9 @@ local function bindLocalCharacter(character)
                     requestBlock(now + CONFIG.RecoveryBlockHold + CONFIG.ComboGap, now, "local health-loss recovery")
                 end
                 debugLog("health_loss", string.format("local health decreased: %.2f -> %.2f", lastHealth, health), 0.5)
-                if CONFIG.LearnMode then beginDamageAnimationScan() end
 
-                -- Learn a damage-correlated hit position only when Learn Mode is enabled and
-                -- a nearby Action-priority track was observed immediately before the damage.
+                -- Damage-correlated timing still uses nearby opponent tracks internally;
+                -- it no longer prints every opponent animation to the console.
                 if CONFIG.LearnMode then
                     local bestRecord, bestScore = nil, math.huge
                     for _, candidate in ipairs(State.ActiveTracks) do
@@ -1171,7 +1091,6 @@ local function combatStep()
                 record.LastEligibleAt = now
                 State.LastThreatAt = now
                 State.LastThreatPlayer = record.Player
-                learnAnimation(record)
             end
 
             local eligible, distance, rejectReason, facingDot, velocityDot = isTargetEligible(record.Player, attackerHumanoid, attackerRoot)
@@ -1186,19 +1105,12 @@ local function combatStep()
                 State.Diagnostics.LastReject = rejectReason or "target not eligible"
                 if not record.RejectLogged then
                     record.RejectLogged = true
-                    debugLog("reject_" .. tostring(record.Player.UserId),
-                        string.format("target rejected: player=%s reason=%s distance=%.2f", record.Player.Name,
-                            tostring(rejectReason or "unknown"), tonumber(distance) or -1), 1.0)
-                end
+                    end
             end
             if eligible then
                 if not record.EligibleLogged then
                     record.EligibleLogged = true
                     State.Diagnostics.TracksAccepted += 1
-                    debugLog("eligible_" .. tostring(record.Player.UserId) .. "_" .. record.AnimationId,
-                        string.format("targeted animation accepted: player=%s id=%s distance=%.2f facing=%.2f velocity=%.2f",
-                            record.Player.Name, record.AnimationId, distance, tonumber(facingDot) or -1,
-                            tonumber(velocityDot) or -1), 0.75)
                 end
                 record.Distance = distance
                 record.LastEligibleAt = now
@@ -1214,9 +1126,7 @@ local function combatStep()
 
                 local age = now - record.StartedAt
                 local actionPriority = isActionPriority(record.Priority)
-                local learnedAttack = CONFIG.LearnedAttackIds[record.AnimationId] == true
-                local priorityAccepted = ((not CONFIG.PriorityFilter) or actionPriority)
-                    and (not CONFIG.LearnedOnlyBlock or learnedAttack)
+                local priorityAccepted = (not CONFIG.PriorityFilter) or actionPriority
                 local safeSpeed = math.max(math.abs(tonumber(speed) or record.Speed), 0.01)
 
                 if recovery and not record.RecoveryTriggered and CONFIG.AutoBlock then
@@ -2166,6 +2076,7 @@ local function makeUI()
     applyWhitelist.Position = UDim2.new(1, -73, 0.5, -14)
 
     pageSection(combat, "Tools")
+    addToggle(combat, "Record my animations", "RecordSelfAnimations")
     addToggle(combat, "Learn mode", "LearnMode")
     addAction(combat, "Test block input", function()
         if pulseAction("Block", CONFIG.BlockKey, 0.16) then toast("Block input sent") else toast("Block input unavailable", "error") end
@@ -2182,7 +2093,7 @@ local function makeUI()
         local d = State.Diagnostics
         print(string.format(
             "[Aero Status] animators=%d tracksSeen=%d tracksAccepted=%d tracksRejected=%d blockRequests=%d target=%s distance=%.1f facing=%.2f velocity=%.2f lastReject=%s lastBlock=%s",
-            learnedCount, d.AnimatorsBound, d.TracksSeen, d.TracksAccepted, d.TracksRejected, d.BlockRequests,
+            d.AnimatorsBound, d.TracksSeen, d.TracksAccepted, d.TracksRejected, d.BlockRequests,
             tostring(d.LastTarget), tonumber(d.LastDistance) or 0,
             tonumber(d.LastFacingDot) or -1, tonumber(d.LastVelocityDot) or -1,
             tostring(d.LastReject), tostring(d.LastBlockReason)
@@ -2221,6 +2132,7 @@ local function makeUI()
             MaxTrackAge = CONFIG.MaxTrackAge, PriorityFilter = CONFIG.PriorityFilter,
             UseMovementDirection = CONFIG.UseMovementDirection, MinAttackerSpeed = CONFIG.MinAttackerSpeed,
             VelocityTowardDot = CONFIG.VelocityTowardDot, ThreatGrace = CONFIG.ThreatGrace,
+            LearnMode = CONFIG.LearnMode, RecordSelfAnimations = CONFIG.RecordSelfAnimations,
         }
         local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
         if not ok then toast("JSON encode failed", "error"); return end
@@ -2385,7 +2297,7 @@ local function saveAeroConfig()
         "InputMode", "InputMethod", "WindowTransparency", "Accent", "AnimateHeader", "LearnedTimings",
         "AttackWhitelist", "LearnDistance", "ZeroLengthFallback", "ZeroLengthHold", "MaxTrackAge",
         "PriorityFilter", "UseMovementDirection", "MinAttackerSpeed", "VelocityTowardDot", "ThreatGrace",
-        "RecoveryEnabled", "RecoveryWindow", "RecoveryBlockHold", "LearnMode"
+        "RecoveryEnabled", "RecoveryWindow", "RecoveryBlockHold", "LearnMode", "RecordSelfAnimations"
     }
     local data = {}
     for _, key in ipairs(keys) do data[key] = CONFIG[key] end
@@ -2452,7 +2364,7 @@ local function getConfigSnapshot()
         "InputMode", "InputMethod", "WindowTransparency", "Accent", "AnimateHeader", "LearnedTimings",
         "AttackWhitelist", "LearnDistance", "ZeroLengthFallback", "ZeroLengthHold", "MaxTrackAge",
         "PriorityFilter", "UseMovementDirection", "MinAttackerSpeed", "VelocityTowardDot", "ThreatGrace",
-        "RecoveryEnabled", "RecoveryWindow", "RecoveryBlockHold", "LearnMode"
+        "RecoveryEnabled", "RecoveryWindow", "RecoveryBlockHold", "LearnMode", "RecordSelfAnimations"
     }
     local data = {}
     for _, key in ipairs(keys) do data[key] = CONFIG[key] end
@@ -2580,7 +2492,7 @@ local function makeWindUI()
         },
     })
     if not AeroWindow then notifyWarn("WindUI window creation failed"); return end
-    pcall(function() AeroWindow:Tag({ Title = "AERO V9", Icon = "github", Color = Color3.fromHex("#7775F2"), Border = true }) end)
+    pcall(function() AeroWindow:Tag({ Title = "AERO V7", Icon = "github", Color = Color3.fromHex("#7775F2"), Border = true }) end)
 
     local combat = AeroWindow:Tab({ Title = "Combat", Icon = "solar:shield-bold", Border = true })
     local settings = AeroWindow:Tab({ Title = "Settings", Icon = "solar:settings-bold", Border = true })
@@ -2622,9 +2534,8 @@ local function makeWindUI()
     end })
 
     combat:Section({ Title = "Learning and diagnostics" })
-    windToggle(combat, "Learn Mode", "LearnMode", "Logs nearby unknown animation tracks; review F9 console")
-    windSlider(combat, "Damage scan radius (studs)", "DamageScanRadius", 5, 15, 1)
-    windToggle(combat, "Block only learned attack IDs", "LearnedOnlyBlock", "Uses animation IDs captured after nearby damage; verify candidates in F9")
+    windToggle(combat, "Record my animations", "RecordSelfAnimations", "Prints Animation IDs from your own character only")
+    windToggle(combat, "Learn Mode", "LearnMode", "Correlates nearby opponent tracks with your health loss")
     combat:Button({ Title = "Test block input", Icon = "shield", Callback = function()
         local sent = pulseAction("Block", CONFIG.BlockKey, 0.16)
         aeroNotify("Input test", sent and "Block input sent" or "Block input unavailable", sent and "check" or "alert-circle")
@@ -2634,14 +2545,12 @@ local function makeWindUI()
         aeroNotify("Input test", sent and "Dodge input sent" or "Dodge input unavailable", sent and "check" or "alert-circle")
     end })
     combat:Button({ Title = "Reset learned timings", Icon = "refresh-ccw", Callback = function()
-        CONFIG.LearnedTimings = {}; CONFIG.LearnedAttackIds = {}; State.LastLearnLog = {}
-        aeroNotify("Learn Mode", "Learned timings and attack IDs cleared", "check")
+        CONFIG.LearnedTimings = {}; State.LastLearnLog = {}
+        aeroNotify("Learn Mode", "Learned timing estimates cleared", "check")
     end })
     combat:Button({ Title = "Print combat diagnostics", Icon = "terminal", Callback = function()
         local d = State.Diagnostics
-        local learnedCount = 0
-        for _ in pairs(CONFIG.LearnedAttackIds) do learnedCount += 1 end
-        print(string.format("[Aero V9 Status] learnedAttackIds=%d | animators=%d tracksSeen=%d tracksAccepted=%d tracksRejected=%d blockRequests=%d target=%s distance=%.1f facing=%.2f velocity=%.2f lastReject=%s lastBlock=%s",
+        print(string.format("[Aero Status] animators=%d tracksSeen=%d tracksAccepted=%d tracksRejected=%d blockRequests=%d target=%s distance=%.1f facing=%.2f velocity=%.2f lastReject=%s lastBlock=%s",
             d.AnimatorsBound, d.TracksSeen, d.TracksAccepted, d.TracksRejected, d.BlockRequests,
             tostring(d.LastTarget), tonumber(d.LastDistance) or 0, tonumber(d.LastFacingDot) or -1,
             tonumber(d.LastVelocityDot) or -1, tostring(d.LastReject), tostring(d.LastBlockReason)))
@@ -2769,6 +2678,163 @@ connect(Players.PlayerRemoving, function(player)
     end
     for i = #State.ActiveTracks, 1, -1 do
         if State.ActiveTracks[i].Player == player then table.remove(State.ActiveTracks, i) end
+    end
+end)
+
+--==============================================================
+-- V9 NPC animation observer / damage-correlated learning
+-- Scans Workspace NPC models (not only Players). Damage correlation is heuristic.
+--==============================================================
+local NpcObservedAnimators = setmetatable({}, { __mode = "k" })
+local NpcObservedModels = setmetatable({}, { __mode = "k" })
+local NpcLearnedIds = {}
+local NpcLastDamageScan = 0
+
+local function npcRoot(model)
+    if not model then return nil end
+    return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+        or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+end
+
+local function npcDistance(model)
+    local _, _, localRoot = getCharacterParts(LocalPlayer)
+    local root = npcRoot(model)
+    if not localRoot or not root then return math.huge end
+    local ok, value = pcall(function() return (localRoot.Position-root.Position).Magnitude end)
+    return ok and value or math.huge
+end
+
+local function logNpcTrack(model, track, reason)
+    local animationId, length, position, speed, weight = "unknown", 0, 0, 1, 0
+    pcall(function()
+        local animation = track.Animation
+        animationId = animation and animation.AnimationId or "unknown"
+        length = track.Length
+        position = track.TimePosition
+        speed = track.Speed
+        weight = track.WeightCurrent
+    end)
+    local distance = npcDistance(model)
+    State.Diagnostics.NpcTracksSeen += 1
+    print(string.format("[Aero V10 DAMAGE] %s | npc=%s | id=%s | distance=%.2f | position=%.3f | length=%.3f | speed=%.2f | weight=%.2f",
+        tostring(reason), model:GetFullName(), tostring(animationId), distance,
+        tonumber(position) or 0, tonumber(length) or 0, tonumber(speed) or 1, tonumber(weight) or 0))
+    return tostring(animationId), distance
+end
+
+local function observeNpcAnimator(model, animator)
+    if not animator or NpcObservedAnimators[animator] then return end
+    local ok, isAnimator = pcall(function() return animator:IsA("Animator") end)
+    if not ok or not isAnimator then return end
+    NpcObservedAnimators[animator] = model
+    State.Diagnostics.NpcAnimatorsBound += 1
+    -- NPC animator binding is intentionally silent; output is reserved for local damage snapshots.
+
+    local function onPlayed(track)
+        local id = "unknown"
+        pcall(function()
+            local animation = track.Animation
+            id = animation and animation.AnimationId or "unknown"
+        end)
+        id = tostring(id or "unknown")
+        local distance = npcDistance(model)
+        -- Do not print every NPC animation. Only a previously damage-correlated ID
+        -- can trigger a short diagnostic and the optional block response.
+        if NpcLearnedIds[id] and distance <= CONFIG.NpcScanRadius then
+            print(string.format("[Aero V10 NPC] learned candidate replay | npc=%s | id=%s | distance=%.2f",
+                model:GetFullName(), id, distance))
+            if CONFIG.AutoBlock then
+                local now = os.clock()
+                requestBlock(now + math.max(CONFIG.BlockHoldAfterImpact, 0.16), now, "learned NPC animation " .. id)
+                setActionHeld("Block", CONFIG.BlockKey, true)
+            end
+        end
+    end
+    connect(animator.AnimationPlayed, onPlayed)
+    local playing = {}
+    pcall(function() playing = animator:GetPlayingAnimationTracks() end)
+    for _, track in ipairs(playing) do onPlayed(track) end
+end
+
+local function observeNpcModel(model)
+    if not model or NpcObservedModels[model] then return end
+    if not model:IsA("Model") or Players:GetPlayerFromCharacter(model) then return end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    NpcObservedModels[model] = true
+    local function inspect(descendant)
+        if descendant:IsA("Animator") then observeNpcAnimator(model, descendant) end
+    end
+    for _, descendant in ipairs(model:GetDescendants()) do inspect(descendant) end
+    connect(model.DescendantAdded, inspect)
+end
+
+-- The training NPC's attack usually reduces the LOCAL character health, not the NPC health.
+-- Observe the local health signal and snapshot every nearby NPC Animator at that moment.
+local function bindLocalDamageScanner(character)
+    task.spawn(function()
+        local humanoid = character:WaitForChild("Humanoid", 8)
+        if not humanoid or State.Unloaded then return end
+        local previous = humanoid.Health
+        connect(humanoid.HealthChanged, function(health)
+            if type(health) ~= "number" then return end
+            local tookDamage = health < previous
+            previous = health
+            if not tookDamage then return end
+            print(string.format("[Aero V10 DAMAGE] local health decreased to %.2f | sampling NPC animations within %.1f studs (correlation, not proof)", health, CONFIG.NpcScanRadius))
+            local reportedThisHit = {}
+            for _, delayTime in ipairs({0, 0.08, 0.18, 0.32}) do
+                task.delay(delayTime, function()
+                    if State.Unloaded then return end
+                    for model in pairs(NpcObservedModels) do
+                        if model and model.Parent and npcDistance(model) <= CONFIG.NpcScanRadius then
+                            for animator, owner in pairs(NpcObservedAnimators) do
+                                if owner == model and animator.Parent then
+                                    local active = {}
+                                    pcall(function() active = animator:GetPlayingAnimationTracks() end)
+                                    for _, track in ipairs(active) do
+                                        local id = "unknown"
+                                        pcall(function()
+                                            local animation = track.Animation
+                                            id = animation and animation.AnimationId or "unknown"
+                                        end)
+                                        id = tostring(id or "unknown")
+                                        local distance = npcDistance(model)
+                                        local reportKey = model:GetFullName() .. "|" .. id
+                                        if distance <= CONFIG.NpcScanRadius and id ~= "unknown" and not reportedThisHit[reportKey] then
+                                            reportedThisHit[reportKey] = true
+                                            logNpcTrack(model, track, "LOCAL_DAMAGE_CORRELATED")
+                                            NpcLearnedIds[id] = true
+                                            print("[Aero V10 DAMAGE] candidate animation (not confirmed hitbox): " .. id)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+        end)
+    end)
+end
+
+-- Initial scan plus future NPC spawns.
+for _, instance in ipairs(workspace:GetDescendants()) do
+    if instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid") then
+        observeNpcModel(instance)
+    end
+end
+if LocalPlayer.Character then bindLocalDamageScanner(LocalPlayer.Character) end
+connect(LocalPlayer.CharacterAdded, bindLocalDamageScanner)
+
+connect(workspace.DescendantAdded, function(instance)
+    if instance:IsA("Model") then
+        task.defer(function() if instance.Parent then observeNpcModel(instance) end end)
+    elseif instance:IsA("Humanoid") or instance:IsA("Animator") then
+        task.defer(function()
+            local model = instance:FindFirstAncestorOfClass("Model")
+            if model then observeNpcModel(model) end
+        end)
     end
 end)
 
