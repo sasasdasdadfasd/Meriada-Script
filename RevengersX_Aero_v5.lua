@@ -1,5 +1,5 @@
 --[=[
-    Revengers X | Aero Combat Toolkit V14 - animation scanner and local viewer
+    Revengers X | Aero Combat Toolkit V15 - 3D animation lab
     Client-side Luau utility for Roblox executors.
 
     IMPORTANT LIMITATIONS
@@ -7,8 +7,8 @@
     - Impact timing prefers common named keyframes when present, then falls back to an animation-ratio estimate.
     - Learn Mode can correlate local health loss with a recently validated nearby opponent track; it does not dump all opponents' animation IDs.
     - Remote input is supported only through an explicit RemoteAdapter configured below.
-    - V14 stores separate local attack-animation profiles per fighting style.
-    - V14 can register captured style IDs as opponent attack candidates when the game reuses the same animation assets across characters.
+    - V15 stores separate local attack-animation profiles per fighting style.
+    - V15 can register captured style IDs as opponent attack candidates when the game reuses the same animation assets across characters.
     - V12 seeded nearby NPC candidates remain available as a separate learned set.
     - Candidate playback can request Auto Block; local health-loss correlations update per-ID statistics.
     - Candidate IDs are not proof of a hitbox; keep validating them against repeated damage events.
@@ -18,7 +18,7 @@
     Recommended: use key input first. Configure exact animation timings only after observing the
     game's animations in Learn mode. This file has not been run inside Roblox or an executor here.
 
-    V14 integration notes (adapted patterns; no foreign game IDs/remotes copied):
+    V15 integration notes (adapted patterns; no foreign game IDs/remotes copied):
     - Animation marker observation: https://github.com/Zyn-ic/AnimateService
     - Config UI foundation: https://github.com/Footagesus/WindUI
     - Cooldown utility pattern: https://github.com/merani2/Roblox-Luau-Utilities
@@ -37,7 +37,7 @@ end)
 --==============================================================
 
 local CONFIG = {
-    Version = 14,
+    Version = 15,
     MenuKey = "RightShift",
     BlockKey = "F",
     DodgeKey = "Q",
@@ -119,6 +119,7 @@ local UIRefs -- forward-declared: Combat Core updates the live sensor when the G
 local printDamageCandidateStats -- forward-declared for GUI diagnostics callbacks.
 local beginStyleCapture, stopStyleCapture, printStyleProfiles, captureSelfTrack, refreshStyleProfiles
 local scanAnimationCatalog, printAnimationCatalog, previewAnimationById, stopAnimationPreview, destroyAnimationPreview
+local openAnimationLabPanel, refreshAnimationLabList
 
 local State = {
     Unloaded = false,
@@ -148,6 +149,12 @@ local State = {
     AnimationPreviewModel = nil,
     AnimationPreviewTrack = nil,
     AnimationPreviewAsset = nil,
+    AnimationPreviewWorld = nil,
+    AnimationPreviewViewport = nil,
+    AnimationLabGui = nil,
+    AnimationLabSelectedId = nil,
+    AnimationLabAutoToken = 0,
+    AnimationLabMarks = {},
     AnimationCatalog = {},
     AnimationCatalogScannedAt = 0,
     KnownTracks = setmetatable({}, { __mode = "k" }),
@@ -919,7 +926,7 @@ local function bindLocalCharacter(character)
         animationId = tostring(animationId or "unknown")
         if animationId == "" then animationId = "unknown" end
         print(string.format(
-            "[Aero V14 SELF] PLAY | name=%s | id=%s | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | source=%s",
+            "[Aero V15 SELF] PLAY | name=%s | id=%s | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | source=%s",
             tostring(animationName), animationId, tonumber(length) or 0, tonumber(speed) or 1,
             tonumber(position) or 0, tostring(priority), tostring(looped), tostring(source or "AnimationPlayed")
         ))
@@ -957,7 +964,7 @@ local function bindLocalCharacter(character)
     end
     connect(character.DescendantAdded, inspectLocalDescendant, State.LocalCharacterConnections)
     if CONFIG.RecordSelfAnimations then
-        print("[Aero V14 SELF] Recorder ready. Perform your combo; your character's Animation IDs will appear below.")
+        print("[Aero V15 SELF] Recorder ready. Perform your combo; your character's Animation IDs will appear below.")
     end
 
     local thread = task.spawn(function()
@@ -2152,6 +2159,9 @@ local function makeUI()
     scanInfo.Position = UDim2.new(0, 9, 0, 4)
     scanInfo.Size = UDim2.new(1, -18, 1, -8)
     scanInfo.TextWrapped = true
+    addAction(animationLab, "Open 3D Animation Lab", function()
+        if openAnimationLabPanel then openAnimationLabPanel() end
+    end)
     addAction(animationLab, "Scan available animations", function()
         if scanAnimationCatalog then scanAnimationCatalog() end
     end)
@@ -2609,7 +2619,7 @@ local function makeWindUI()
         },
     })
     if not AeroWindow then notifyWarn("WindUI window creation failed"); return end
-    pcall(function() AeroWindow:Tag({ Title = "AERO V14", Icon = "github", Color = Color3.fromHex("#7775F2"), Border = true }) end)
+    pcall(function() AeroWindow:Tag({ Title = "AERO V15", Icon = "github", Color = Color3.fromHex("#7775F2"), Border = true }) end)
 
     local combat = AeroWindow:Tab({ Title = "Combat", Icon = "solar:shield-bold", Border = true })
     local animationLab = AeroWindow:Tab({ Title = "Animation Lab", Icon = "solar:play-circle-bold", Border = true })
@@ -2671,6 +2681,9 @@ local function makeWindUI()
         Title = "Client-visible assets only",
         Desc = "Scans Animation instances currently present in replicated containers, player containers, character and Workspace. Some styles may load only after you equip/select them; scan again after switching styles. This does not interact with other players.",
     })
+    animationLab:Button({ Title = "Open 3D Animation Lab", Icon = "box", Callback = function()
+        if openAnimationLabPanel then openAnimationLabPanel() end
+    end })
     animationLab:Button({ Title = "Scan available animations", Icon = "scan-search", Callback = function()
         if scanAnimationCatalog then scanAnimationCatalog() end
     end })
@@ -2794,6 +2807,7 @@ local function unload()
     State.WatchedAnimators = {}
     if stopAnimationPreview then pcall(stopAnimationPreview) end
     if destroyAnimationPreview then pcall(destroyAnimationPreview) end
+    if State.AnimationLabGui then pcall(function() State.AnimationLabGui:Destroy() end); State.AnimationLabGui = nil end
 
     for _, bucket in pairs(State.CharacterConnections) do
         for _, connection in ipairs(bucket) do pcall(function() connection:Disconnect() end) end
@@ -2845,7 +2859,7 @@ connect(Players.PlayerRemoving, function(player)
 end)
 
 --==============================================================
--- V14 nearby remote animation observer / seeded and style-profile attack candidates
+-- V15 nearby remote animation observer / seeded and style-profile attack candidates
 -- Watches PLAYER characters and NPCs silently. Logs only tracks near the
 -- moment local health decreases. Animation visibility still depends on replication.
 --==============================================================
@@ -3025,7 +3039,7 @@ local function reportDamageTrack(record, reason, reported)
     end
 
     print(string.format(
-        "[Aero V14 DAMAGE] %s | type=%s | target=%s | id=%s | animName=%s | distance=%.2f | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | candidate=%s | styleProfile=%s | matches=%d | plays=%d",
+        "[Aero V15 DAMAGE] %s | type=%s | target=%s | id=%s | animName=%s | distance=%.2f | length=%.3f | speed=%.2f | position=%.3f | priority=%s | looped=%s | candidate=%s | styleProfile=%s | matches=%d | plays=%d",
         tostring(reason), tostring(record.Kind), tostring(record.OwnerName), tostring(normalizedId),
         tostring(record.Name), distance, record.Length, record.Speed, record.Position,
         tostring(record.Priority), tostring(record.Looped),
@@ -3066,7 +3080,7 @@ local function observeDamageAnimator(model, animator)
             stats.LastPlayAt = now
             local targeted, targetReason, facingDot, velocityDot = damageTargetIsRelevant(model)
             print(string.format(
-                "[Aero V14 ATTACK] CANDIDATE_PLAY | type=%s | target=%s | id=%s | distance=%.2f | length=%.3f | position=%.3f | priority=%s | seeded=%s | styleProfile=%s | targeted=%s | direction=%s | facing=%.2f | velocity=%.2f | plays=%d | damageMatches=%d",
+                "[Aero V15 ATTACK] CANDIDATE_PLAY | type=%s | target=%s | id=%s | distance=%.2f | length=%.3f | position=%.3f | priority=%s | seeded=%s | styleProfile=%s | targeted=%s | direction=%s | facing=%.2f | velocity=%.2f | plays=%d | damageMatches=%d",
                 tostring(record.Kind), tostring(record.OwnerName), normalizedId, distance,
                 record.Length, record.Position, tostring(record.Priority), tostring(stats.Seeded),
                 tostring(DamageStyleProfileById[normalizedId] or "none"), tostring(targeted), tostring(targetReason),
@@ -3086,10 +3100,10 @@ local function observeDamageAnimator(model, animator)
                     -- combo gap. This is a conservative animation-window heuristic.
                     local animationHold = math.min(math.max(record.Length, 0.20), 0.65)
                     local hold = math.max(CONFIG.BlockHoldAfterImpact, animationHold) + CONFIG.ComboGap
-                    requestBlock(now + hold, now, "V14 style profile candidate animation " .. normalizedId)
+                    requestBlock(now + hold, now, "V15 style profile candidate animation " .. normalizedId)
                     setActionHeld("Block", CONFIG.BlockKey, true)
                     print(string.format(
-                        "[Aero V14 AUTOBLOCK] requested | id=%s | hold=%.2fs | target=%s",
+                        "[Aero V15 AUTOBLOCK] requested | id=%s | hold=%.2fs | target=%s",
                         normalizedId, hold, tostring(record.OwnerName)
                     ))
                 end
@@ -3162,7 +3176,7 @@ local function nearbyDamageSnapshot(damageAt, reported, reason)
 end
 
 printDamageCandidateStats = function()
-    print("[Aero V14 STATS] Damage-correlated animation candidates:")
+    print("[Aero V15 STATS] Damage-correlated animation candidates:")
     local ids = {}
     for id in pairs(DamageCandidateStats) do table.insert(ids, id) end
     table.sort(ids)
@@ -3170,7 +3184,7 @@ printDamageCandidateStats = function()
         local stats = DamageCandidateStats[id]
         if stats and (stats.Seeded or stats.Plays > 0 or stats.DamageMatches > 0 or DamageStyleProfileById[id]) then
             print(string.format(
-                "[Aero V14 STATS] id=%s | seeded=%s | plays=%d | damageMatches=%d | styleProfile=%s | lastTarget=%s",
+                "[Aero V15 STATS] id=%s | seeded=%s | plays=%d | damageMatches=%d | styleProfile=%s | lastTarget=%s",
                 id, tostring(stats.Seeded), stats.Plays, stats.DamageMatches,
                 tostring(DamageStyleProfileById[id] or "none"), tostring(stats.LastTarget)
             ))
@@ -3193,7 +3207,7 @@ captureSelfTrack = function(record)
     capture.Seen[normalized] = true
     table.insert(capture.Ids, normalized)
     print(string.format(
-        "[Aero V14 STYLE] CAPTURED | profile=%s | id=%s | length=%.3f | priority=%s | looped=%s",
+        "[Aero V15 STYLE] CAPTURED | profile=%s | id=%s | length=%.3f | priority=%s | looped=%s",
         tostring(capture.Name), normalized, tonumber(record.Length) or 0,
         priority, tostring(record.Looped)
     ))
@@ -3203,7 +3217,7 @@ beginStyleCapture = function(name)
     name = string.gsub(tostring(name or ""), "^%s*(.-)%s*$", "%1")
     name = string.sub(name, 1, 32)
     if name == "" then
-        print("[Aero V14 STYLE] Enter a style profile name first.")
+        print("[Aero V15 STYLE] Enter a style profile name first.")
         return false
     end
     CONFIG.StyleProfiles = type(CONFIG.StyleProfiles) == "table" and CONFIG.StyleProfiles or {}
@@ -3219,7 +3233,7 @@ beginStyleCapture = function(name)
         end
     end
     State.ActiveStyleCapture = { Name = name, Ids = ids, Seen = seen, StartedAt = os.clock() }
-    print(string.format("[Aero V14 STYLE] CAPTURE STARTED | profile=%s | existingIDs=%d | perform this style's combo now", name, #ids))
+    print(string.format("[Aero V15 STYLE] CAPTURE STARTED | profile=%s | existingIDs=%d | perform this style's combo now", name, #ids))
     pcall(function() aeroNotify("Style capture", "Recording " .. name .. " attacks", "disc-3") end)
     return true
 end
@@ -3227,7 +3241,7 @@ end
 stopStyleCapture = function()
     local capture = State.ActiveStyleCapture
     if not capture then
-        print("[Aero V14 STYLE] No active style capture.")
+        print("[Aero V15 STYLE] No active style capture.")
         return false
     end
     State.ActiveStyleCapture = nil
@@ -3235,34 +3249,34 @@ stopStyleCapture = function()
     CONFIG.StyleProfiles[capture.Name] = capture.Ids
     local registered = registerStyleProfile(capture.Name, capture.Ids)
     print(string.format(
-        "[Aero V14 STYLE] PROFILE REGISTERED | profile=%s | ids=%d | registeredCandidates=%d | save config JSON to persist",
+        "[Aero V15 STYLE] PROFILE REGISTERED | profile=%s | ids=%d | registeredCandidates=%d | save config JSON to persist",
         tostring(capture.Name), #capture.Ids, registered
     ))
     for index, id in ipairs(capture.Ids) do
-        print(string.format("[Aero V14 STYLE] PROFILE_ID | profile=%s | index=%d | id=%s", capture.Name, index, id))
+        print(string.format("[Aero V15 STYLE] PROFILE_ID | profile=%s | index=%d | id=%s", capture.Name, index, id))
     end
     pcall(function() aeroNotify("Style profile", capture.Name .. " saved in memory: " .. tostring(#capture.Ids) .. " IDs", "check") end)
     return true
 end
 
 printStyleProfiles = function()
-    print("[Aero V14 STYLE] Saved style profiles:")
+    print("[Aero V15 STYLE] Saved style profiles:")
     local names = {}
     for name in pairs(CONFIG.StyleProfiles or {}) do table.insert(names, name) end
     table.sort(names)
     for _, name in ipairs(names) do
         local ids = CONFIG.StyleProfiles[name]
-        print(string.format("[Aero V14 STYLE] PROFILE | name=%s | ids=%d", tostring(name), type(ids) == "table" and #ids or 0))
+        print(string.format("[Aero V15 STYLE] PROFILE | name=%s | ids=%d", tostring(name), type(ids) == "table" and #ids or 0))
         if type(ids) == "table" then
             for index, id in ipairs(ids) do
-                print(string.format("[Aero V14 STYLE] PROFILE_ID | profile=%s | index=%d | id=%s", tostring(name), index, tostring(id)))
+                print(string.format("[Aero V15 STYLE] PROFILE_ID | profile=%s | index=%d | id=%s", tostring(name), index, tostring(id)))
             end
         end
     end
 end
 
 --==============================================================
--- V14 Animation Lab: scan client-visible Animation instances and
+-- V15 Animation Lab: scan client-visible Animation instances and
 -- preview an asset on a local-only clone of the current character.
 -- No other player's character is modified or used as a preview rig.
 --==============================================================
@@ -3366,6 +3380,7 @@ scanAnimationCatalog = function()
     AnimationCatalog = byId
     State.AnimationCatalog = byId
     State.AnimationCatalogScannedAt = os.clock()
+    if refreshAnimationLabList then pcall(refreshAnimationLabList) end
     local unique = 0
     local groupCounts = {}
     for _, entry in pairs(byId) do
@@ -3373,16 +3388,16 @@ scanAnimationCatalog = function()
         groupCounts[entry.Group] = (groupCounts[entry.Group] or 0) + 1
     end
 
-    print(string.format("[Aero V14 SCAN] complete | visited=%d | AnimationObjects=%d | uniqueIDs=%d | limit=%d",
+    print(string.format("[Aero V15 SCAN] complete | visited=%d | AnimationObjects=%d | uniqueIDs=%d | limit=%d",
         visited, foundObjects, unique, ANIMATION_SCAN_MAX_VISITED))
     local groupNames = {}
     for name in pairs(groupCounts) do table.insert(groupNames, name) end
     table.sort(groupNames)
     for _, name in ipairs(groupNames) do
-        print(string.format("[Aero V14 SCAN] GROUP | %s | uniqueIDs=%d", name, groupCounts[name]))
+        print(string.format("[Aero V15 SCAN] GROUP | %s | uniqueIDs=%d", name, groupCounts[name]))
     end
     if unique == 0 then
-        print("[Aero V14 SCAN] No client-visible Animation instances with IDs were found. Some assets may only be created after equipping a style; switch styles and scan again.")
+        print("[Aero V15 SCAN] No client-visible Animation instances with IDs were found. Some assets may only be created after equipping a style; switch styles and scan again.")
     end
     pcall(function()
         aeroNotify("Animation scan", string.format("Found %d unique Animation IDs", unique), "scan-search")
@@ -3397,18 +3412,18 @@ printAnimationCatalog = function()
         count += 1
     end
     table.sort(names)
-    print(string.format("[Aero V14 SCAN] catalog | uniqueIDs=%d | scannedAt=%.2f", count, tonumber(State.AnimationCatalogScannedAt) or 0))
+    print(string.format("[Aero V15 SCAN] catalog | uniqueIDs=%d | scannedAt=%.2f", count, tonumber(State.AnimationCatalogScannedAt) or 0))
     local printed = 0
     for _, id in ipairs(names) do
         if printed >= ANIMATION_PRINT_LIMIT then
-            print(string.format("[Aero V14 SCAN] output capped at %d IDs; catalog still contains %d", ANIMATION_PRINT_LIMIT, count))
+            print(string.format("[Aero V15 SCAN] output capped at %d IDs; catalog still contains %d", ANIMATION_PRINT_LIMIT, count))
             break
         end
         local entry = AnimationCatalog[id]
-        print(string.format("[Aero V14 SCAN] ID | group=%s | name=%s | id=%s | occurrences=%d",
+        print(string.format("[Aero V15 SCAN] ID | group=%s | name=%s | id=%s | occurrences=%d",
             tostring(entry.Group), tostring(entry.Name), tostring(id), tonumber(entry.Occurrences) or 1))
         for _, path in ipairs(entry.Paths or {}) do
-            print("[Aero V14 SCAN] PATH | " .. tostring(path))
+            print("[Aero V15 SCAN] PATH | " .. tostring(path))
         end
         printed += 1
     end
@@ -3433,6 +3448,9 @@ destroyAnimationPreview = function()
     local model = State.AnimationPreviewModel
     State.AnimationPreviewModel = nil
     if model then pcall(function() model:Destroy() end) end
+    if State.AnimationPreviewWorld then
+        for _, child in ipairs(State.AnimationPreviewWorld:GetChildren()) do pcall(function() child:Destroy() end) end
+    end
     pcall(function() aeroNotify("Animation viewer", "Local preview dummy removed", "trash-2") end)
 end
 
@@ -3440,12 +3458,15 @@ local function ensureAnimationPreviewRig()
     if State.AnimationPreviewModel and State.AnimationPreviewModel.Parent then
         return State.AnimationPreviewModel
     end
-    if not Workspace then return nil, "Workspace service unavailable" end
     local character = LocalPlayer.Character
     if not character then return nil, "Your character is not available" end
+    local viewport = State.AnimationPreviewViewport
+    local world = State.AnimationPreviewWorld
+    if not viewport or not viewport.Parent or not world or not world.Parent then
+        return nil, "Open the 3D Animation Lab first"
+    end
 
     local previousArchivable = character.Archivable
-    local clone
     local cloneOk, cloneResult = pcall(function()
         character.Archivable = true
         local result = character:Clone()
@@ -3454,16 +3475,12 @@ local function ensureAnimationPreviewRig()
     end)
     pcall(function() character.Archivable = previousArchivable end)
     if not cloneOk or not cloneResult then
-        return nil, "Could not clone your character for local preview"
+        return nil, "Could not clone your character for the viewport"
     end
-    clone = cloneResult
-    clone.Name = "AERO_LocalAnimationPreview"
-
+    local clone = cloneResult
+    clone.Name = "AERO_V15_R6_AnimationDummy"
     local humanoid = clone:FindFirstChildOfClass("Humanoid")
-    if not humanoid then
-        pcall(function() clone:Destroy() end)
-        return nil, "Cloned rig has no Humanoid"
-    end
+    if not humanoid then clone:Destroy(); return nil, "Cloned rig has no Humanoid" end
 
     for _, descendant in ipairs(clone:GetDescendants()) do
         if descendant:IsA("Script") or descendant:IsA("LocalScript") then
@@ -3478,14 +3495,8 @@ local function ensureAnimationPreviewRig()
             end)
         end
     end
-
     local animator = humanoid:FindFirstChildOfClass("Animator")
-    if not animator then
-        animator = Instance.new("Animator")
-        animator.Parent = humanoid
-    end
-    local root = clone:FindFirstChild("HumanoidRootPart") or clone.PrimaryPart
-    if root and root:IsA("BasePart") then root.Anchored = true end
+    if not animator then animator = Instance.new("Animator"); animator.Parent = humanoid end
     pcall(function()
         humanoid.AutoRotate = false
         humanoid.WalkSpeed = 0
@@ -3493,14 +3504,19 @@ local function ensureAnimationPreviewRig()
         humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
         humanoid.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
     end)
+    clone.Parent = world
+    pcall(function() clone:PivotTo(CFrame.new(0, 0, 0)) end)
+    local rootPart = clone:FindFirstChild("HumanoidRootPart") or clone.PrimaryPart
+    if rootPart and rootPart:IsA("BasePart") then rootPart.Anchored = true end
 
-    local _, _, localRoot = getCharacterParts(LocalPlayer)
-    local pivot = CFrame.new(0, 5, 0)
-    if localRoot then
-        pcall(function() pivot = localRoot.CFrame * CFrame.new(5, 0, -2) end)
+    local boxCFrame, boxSize = clone:GetBoundingBox()
+    local focus = boxCFrame.Position + Vector3.new(0, boxSize.Y * 0.08, 0)
+    local distance = math.max(boxSize.X, boxSize.Y, boxSize.Z) * 2.25
+    local camera = viewport.CurrentCamera
+    if camera then
+        camera.FieldOfView = 35
+        camera.CFrame = CFrame.lookAt(focus + Vector3.new(distance * 0.72, distance * 0.22, distance), focus)
     end
-    clone.Parent = Workspace
-    pcall(function() clone:PivotTo(pivot) end)
     State.AnimationPreviewModel = clone
     return clone
 end
@@ -3516,13 +3532,13 @@ previewAnimationById = function(rawId)
     local model, err = ensureAnimationPreviewRig()
     if not model then
         pcall(function() aeroNotify("Animation viewer", tostring(err), "alert-circle") end)
-        warn("[Aero V14 VIEWER] " .. tostring(err))
+        warn("[Aero V15 VIEWER] " .. tostring(err))
         return false
     end
     local humanoid = model:FindFirstChildOfClass("Humanoid")
     local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
     if not animator then
-        warn("[Aero V14 VIEWER] Preview rig Animator is unavailable")
+        warn("[Aero V15 VIEWER] Preview rig Animator is unavailable")
         return false
     end
 
@@ -3532,7 +3548,7 @@ previewAnimationById = function(rawId)
     local loaded, trackOrError = pcall(function() return animator:LoadAnimation(animation) end)
     if not loaded or not trackOrError then
         pcall(function() animation:Destroy() end)
-        warn("[Aero V14 VIEWER] LoadAnimation failed: " .. tostring(trackOrError))
+        warn("[Aero V15 VIEWER] LoadAnimation failed: " .. tostring(trackOrError))
         pcall(function() aeroNotify("Animation viewer", "Could not load this asset; it may be private or unavailable", "alert-circle") end)
         return false
     end
@@ -3544,13 +3560,171 @@ previewAnimationById = function(rawId)
     end)
     if not played then
         stopAnimationPreview()
-        warn("[Aero V14 VIEWER] Playback failed: " .. tostring(playError))
+        warn("[Aero V15 VIEWER] Playback failed: " .. tostring(playError))
         pcall(function() aeroNotify("Animation viewer", "Animation loaded but playback failed", "alert-circle") end)
         return false
     end
-    print(string.format("[Aero V14 VIEWER] preview started | id=%s | rig=%s", normalized, model.Name))
+    print(string.format("[Aero V15 VIEWER] preview started | id=%s | rig=%s", normalized, model.Name))
     pcall(function() aeroNotify("Animation viewer", "Playing " .. normalized, "play") end)
     return true
+end
+
+
+-- V15: independent on-screen 3D viewport lab. The rig lives inside a ViewportFrame
+-- WorldModel, not in Workspace, so it is only a visual preview on this client.
+openAnimationLabPanel = function()
+    if State.Unloaded then return end
+    if State.AnimationLabGui and State.AnimationLabGui.Parent then
+        State.AnimationLabGui.Enabled = true
+        return
+    end
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 8)
+    if not playerGui then warn("[Aero V15 LAB] PlayerGui unavailable"); return end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AERO_V15_AnimationLab"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 120
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = playerGui
+    State.AnimationLabGui = gui
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.Size = UDim2.fromOffset(760, 470)
+    panel.Position = UDim2.new(0.5, -380, 0.5, -235)
+    panel.BackgroundColor3 = Color3.fromRGB(20, 24, 32)
+    panel.BorderSizePixel = 0
+    panel.Parent = gui
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", panel); stroke.Color = Color3.fromRGB(83, 105, 145); stroke.Thickness = 1
+
+    local top = Instance.new("Frame")
+    top.Size = UDim2.new(1, 0, 0, 38); top.BackgroundColor3 = Color3.fromRGB(32, 40, 55); top.BorderSizePixel = 0; top.Parent = panel
+    Instance.new("UICorner", top).CornerRadius = UDim.new(0, 10)
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1; title.Position = UDim2.fromOffset(12, 0); title.Size = UDim2.new(1, -100, 1, 0)
+    title.Font = Enum.Font.GothamBold; title.TextSize = 14; title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = Color3.fromRGB(235, 241, 255); title.Text = "AERO V15  |  3D ANIMATION LAB"; title.Parent = top
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.fromOffset(32, 28); close.Position = UDim2.new(1, -38, 0, 5); close.Text = "×"
+    close.Font = Enum.Font.GothamBold; close.TextSize = 20; close.TextColor3 = Color3.new(1,1,1)
+    close.BackgroundColor3 = Color3.fromRGB(150, 60, 70); close.BorderSizePixel = 0; close.Parent = top
+    Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+    close.MouseButton1Click:Connect(function() gui.Enabled = false end)
+
+    -- Simple drag handle for desktop use.
+    local dragging, dragStart, panelStart = false, nil, nil
+    top.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true; dragStart = input.Position; panelStart = panel.Position end
+    end)
+    top.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+    top.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement and dragging then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X, panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
+        end
+    end)
+
+    local viewport = Instance.new("ViewportFrame")
+    viewport.Name = "DummyViewport"; viewport.Position = UDim2.fromOffset(12, 50); viewport.Size = UDim2.fromOffset(390, 355)
+    viewport.BackgroundColor3 = Color3.fromRGB(12, 16, 23); viewport.BorderSizePixel = 0; viewport.Ambient = Color3.fromRGB(175, 185, 205)
+    viewport.LightColor = Color3.fromRGB(255, 255, 255); viewport.LightDirection = Vector3.new(-1, -1, -1); viewport.Parent = panel
+    Instance.new("UICorner", viewport).CornerRadius = UDim.new(0, 8)
+    local camera = Instance.new("Camera"); camera.Name = "LabCamera"; camera.Parent = viewport; viewport.CurrentCamera = camera
+    local world = Instance.new("WorldModel"); world.Name = "PreviewWorld"; world.Parent = viewport
+    State.AnimationPreviewViewport = viewport
+    State.AnimationPreviewWorld = world
+
+    local info = Instance.new("TextLabel")
+    info.Name = "Info"; info.Position = UDim2.fromOffset(12, 413); info.Size = UDim2.fromOffset(390, 42)
+    info.BackgroundTransparency = 1; info.Font = Enum.Font.Code; info.TextSize = 11; info.TextWrapped = true
+    info.TextXAlignment = Enum.TextXAlignment.Left; info.TextYAlignment = Enum.TextYAlignment.Top
+    info.TextColor3 = Color3.fromRGB(190, 205, 230); info.Text = "Scan the catalog, then select an animation."; info.Parent = panel
+    State.AnimationLabInfo = info
+
+    local list = Instance.new("ScrollingFrame")
+    list.Name = "AnimationList"; list.Position = UDim2.fromOffset(414, 50); list.Size = UDim2.fromOffset(334, 355)
+    list.BackgroundColor3 = Color3.fromRGB(14, 18, 26); list.BorderSizePixel = 0; list.ScrollBarThickness = 5
+    list.CanvasSize = UDim2.new(); list.AutomaticCanvasSize = Enum.AutomaticSize.Y; list.Parent = panel
+    Instance.new("UICorner", list).CornerRadius = UDim.new(0, 8)
+    local layout = Instance.new("UIListLayout"); layout.Padding = UDim.new(0, 4); layout.SortOrder = Enum.SortOrder.LayoutOrder; layout.Parent = list
+    local padding = Instance.new("UIPadding"); padding.PaddingTop = UDim.new(0, 6); padding.PaddingLeft = UDim.new(0, 6); padding.PaddingRight = UDim.new(0, 6); padding.Parent = list
+    State.AnimationLabList = list
+
+    local function mkButton(textValue, x, width, callback)
+        local b = Instance.new("TextButton"); b.Size = UDim2.fromOffset(width, 30); b.Position = UDim2.fromOffset(x, 0)
+        b.BackgroundColor3 = Color3.fromRGB(52, 70, 102); b.BorderSizePixel = 0; b.Text = textValue
+        b.Font = Enum.Font.GothamSemibold; b.TextSize = 11; b.TextColor3 = Color3.fromRGB(245, 248, 255); b.Parent = panel
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+        b.MouseButton1Click:Connect(callback)
+        return b
+    end
+    local controlsY = 413
+    mkButton("PREV", 414, 54, function() if State.AnimationLabSelectIndex then State.AnimationLabSelectIndex = math.max(1, State.AnimationLabSelectIndex - 1); if State.AnimationLabIds then previewAnimationById(State.AnimationLabIds[State.AnimationLabSelectIndex]) end end end).Position = UDim2.fromOffset(414, controlsY)
+    mkButton("PLAY", 472, 54, function() if State.AnimationLabSelectedId then previewAnimationById(State.AnimationLabSelectedId) end end).Position = UDim2.fromOffset(472, controlsY)
+    mkButton("STOP", 530, 54, function() State.AnimationLabAutoToken = (State.AnimationLabAutoToken or 0) + 1; if stopAnimationPreview then stopAnimationPreview() end end).Position = UDim2.fromOffset(530, controlsY)
+    mkButton("NEXT", 588, 54, function() if State.AnimationLabSelectIndex and State.AnimationLabIds then State.AnimationLabSelectIndex = math.min(#State.AnimationLabIds, State.AnimationLabSelectIndex + 1); previewAnimationById(State.AnimationLabIds[State.AnimationLabSelectIndex]) end end).Position = UDim2.fromOffset(588, controlsY)
+    mkButton("AUTO", 646, 48, function()
+        State.AnimationLabAutoToken = (State.AnimationLabAutoToken or 0) + 1
+        local token = State.AnimationLabAutoToken
+        task.spawn(function()
+            local ids = State.AnimationLabIds or {}
+            for i, id in ipairs(ids) do
+                if State.Unloaded or token ~= State.AnimationLabAutoToken then break end
+                State.AnimationLabSelectIndex = i
+                previewAnimationById(id)
+                task.wait(1.15)
+            end
+        end)
+    end).Position = UDim2.fromOffset(646, controlsY)
+
+    local function mark(kind)
+        local id = State.AnimationLabSelectedId
+        if not id then return end
+        State.AnimationLabMarks[id] = kind
+        print(string.format("[Aero V15 LAB] marked | id=%s | type=%s", id, kind))
+        if State.AnimationLabInfo then State.AnimationLabInfo.Text = "Selected: " .. id .. "\nMarked as: " .. kind end
+    end
+    mkButton("ATTACK", 12, 88, function() mark("Attack") end).Position = UDim2.fromOffset(12, 0)
+    mkButton("MOVEMENT", 104, 100, function() mark("Movement") end).Position = UDim2.fromOffset(104, 0)
+    mkButton("SCAN", 210, 76, function() if scanAnimationCatalog then scanAnimationCatalog() end end).Position = UDim2.fromOffset(210, 0)
+    mkButton("CLEAR", 292, 76, function() if destroyAnimationPreview then destroyAnimationPreview() end end).Position = UDim2.fromOffset(292, 0)
+    -- Put classification/scan controls in a dedicated row above the viewport.
+    for _, child in ipairs(panel:GetChildren()) do
+        if child:IsA("TextButton") and child.Position.Y.Offset == 0 then child.Position = UDim2.fromOffset(child.Position.X.Offset, 50) end
+    end
+    viewport.Position = UDim2.fromOffset(12, 88); viewport.Size = UDim2.fromOffset(390, 317)
+    list.Position = UDim2.fromOffset(414, 88); list.Size = UDim2.fromOffset(334, 317)
+    info.Position = UDim2.fromOffset(12, 413)
+    State.AnimationLabInfo.Text = "R6 preview uses your current character rig. If your avatar is R15, this viewport will be R15 instead.\nScan to populate the list."
+    if refreshAnimationLabList then refreshAnimationLabList() end
+end
+
+refreshAnimationLabList = function()
+    local list = State.AnimationLabList
+    if not list or not list.Parent then return end
+    for _, child in ipairs(list:GetChildren()) do if child:IsA("TextButton") or child:IsA("TextLabel") then child:Destroy() end end
+    local ids = {}
+    for id in pairs(AnimationCatalog) do table.insert(ids, id) end
+    table.sort(ids)
+    State.AnimationLabIds = ids
+    for index, id in ipairs(ids) do
+        local entry = AnimationCatalog[id]
+        local row = Instance.new("TextButton")
+        row.Name = "Animation_" .. tostring(index); row.Size = UDim2.new(1, -8, 0, 42)
+        row.BackgroundColor3 = Color3.fromRGB(34, 43, 60); row.BorderSizePixel = 0
+        row.Text = string.format("%02d  %s\n%s  |  %s", index, tostring(entry.Name or "Animation"), tostring(id), tostring(entry.Group or "Unclassified"))
+        row.Font = Enum.Font.Code; row.TextSize = 10; row.TextColor3 = Color3.fromRGB(225, 235, 250); row.TextXAlignment = Enum.TextXAlignment.Left
+        row.Parent = list; Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+        row.MouseButton1Click:Connect(function()
+            State.AnimationLabSelectedId = id; State.AnimationLabSelectIndex = index
+            if State.AnimationLabInfo then State.AnimationLabInfo.Text = string.format("[%d/%d] %s\n%s", index, #ids, id, tostring(entry.Group or "Unclassified")) end
+            previewAnimationById(id)
+        end)
+    end
+    if State.AnimationLabInfo then State.AnimationLabInfo.Text = string.format("Catalog: %d unique IDs\nSelect an item to preview it.", #ids) end
 end
 
 local function bindLocalDamageScanner(character)
@@ -3567,7 +3741,7 @@ local function bindLocalDamageScanner(character)
             local damageAt = os.clock()
             local reported = {}
             print(string.format(
-                "[Aero V14 DAMAGE] local health decreased to %.2f | correlating PLAYER + NPC tracks within %.1f studs",
+                "[Aero V15 DAMAGE] local health decreased to %.2f | correlating PLAYER + NPC tracks within %.1f studs",
                 health, CONFIG.NpcScanRadius
             ))
             nearbyDamageSnapshot(damageAt, reported, "ACTIVE_AT_DAMAGE")
@@ -3582,7 +3756,7 @@ local function bindLocalDamageScanner(character)
                 if State.Unloaded then return end
                 if not next(reported) then
                     print(string.format(
-                        "[Aero V14 DAMAGE] NO REMOTE TRACK FOUND | radius=%.1f | possible causes: opponent animations are not replicated, target has no Humanoid/AnimationController Animator, or target was outside radius",
+                        "[Aero V15 DAMAGE] NO REMOTE TRACK FOUND | radius=%.1f | possible causes: opponent animations are not replicated, target has no Humanoid/AnimationController Animator, or target was outside radius",
                         CONFIG.NpcScanRadius
                     ))
                 end
@@ -3707,4 +3881,4 @@ if false and (UIRefs.Gradient or UIRefs.Shimmer) then
     addThread(thread)
 end
 
-print("[Aero] Revengers X toolkit V14 initialized. Animation Lab can scan client-visible Animation objects and preview an entered ID on a local-only dummy. Some styles may load lazily; re-scan after switching styles. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
+print("[Aero] Revengers X toolkit V15 initialized. Animation Lab includes a local 3D viewport, catalog list, sequential preview and manual Attack/Movement labels. Some styles may load lazily; re-scan after switching styles. RightShift toggles the menu; unload with the UI button or _G.AERO_REVENGERS_UNLOAD().")
